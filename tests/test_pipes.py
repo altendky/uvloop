@@ -69,6 +69,7 @@ class MyWritePipeProto(asyncio.BaseProtocol):
         self.paused = False
 
 
+@tb.skip_windows
 class _BasePipeTest:
     def test_read_pipe(self):
         proto = MyReadPipeProto(loop=self.loop)

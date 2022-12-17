@@ -220,10 +220,10 @@ class _TestTCP:
         with sock:
             addr = sock.getsockname()
 
-            with self.assertRaisesRegex(OSError,
-                                        r"error while attempting.*\('127.*: "
-                                        r"address( already)? in use"):
+            re = r"(error while attempting.*\('127.*: address already in use)"
+            re += r"|(error while attempting to bind.*only one usage)"  # win
 
+            with self.assertRaisesRegex(OSError, re):
                 self.loop.run_until_complete(
                     self.loop.create_server(object, *addr))
 
@@ -519,7 +519,10 @@ class _TestTCP:
             await self.wait_closed(writer)
 
         async def runner():
-            with self.assertRaisesRegex(OSError, 'Bad file'):
+            re = r"(Bad file)"
+            re += r"|(is not a socket)"  # win
+
+            with self.assertRaisesRegex(OSError, re):
                 await client()
 
         self.loop.run_until_complete(runner())

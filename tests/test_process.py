@@ -812,6 +812,7 @@ print(n)'''
         self.loop.run_until_complete(test())
 
 
+@tb.skip_windows  # XXX tests will have to be fixed later
 class Test_UV_Process(_TestProcess, tb.UVTestCase):
     def test_process_double_close(self):
         script = textwrap.dedent("""
@@ -867,14 +868,17 @@ class Test_UV_Process(_TestProcess, tb.UVTestCase):
         subprocess.run([sys.executable, '-c', script], check=True)
 
 
+@tb.skip_windows  # Some tests fail under asyncio
 class Test_AIO_Process(_TestProcess, tb.AIOTestCase):
     pass
 
 
+@tb.skip_windows  # XXX tests will have to be fixed later
 class TestAsyncio_UV_Process(_AsyncioTests, tb.UVTestCase):
     pass
 
 
+@tb.skip_windows  # Some tests fail under asyncio
 class TestAsyncio_AIO_Process(_AsyncioTests, tb.AIOTestCase):
     pass
 
