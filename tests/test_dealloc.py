@@ -36,7 +36,7 @@ async def foo():
     return 42
 
 def main():
-    asyncio.set_event_loop(uvloop.new_event_loop())
+    uvloop.install()
     loop = asyncio.get_event_loop()
     loop.set_debug(True)
     loop.run_until_complete(foo())
@@ -48,10 +48,9 @@ if __name__ == '__main__':
 
             cmd = sys.executable
             proc = await asyncio.create_subprocess_exec(
-                cmd, b'-c', prog,
+                cmd, b'-W', b'ignore', b'-c', prog,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                loop=self.loop)
+                stderr=subprocess.PIPE)
 
             await proc.wait()
             out = await proc.stdout.read()

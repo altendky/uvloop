@@ -1,5 +1,7 @@
 import asyncio
 import concurrent.futures
+import multiprocessing
+import unittest
 
 from uvloop import _testbase as tb
 
@@ -19,13 +21,16 @@ class _TestExecutors:
                 coros = []
                 for i in range(0, 10):
                     coros.append(self.loop.run_in_executor(pool, fib, i))
-                res = await asyncio.gather(*coros, loop=self.loop)
+                res = await asyncio.gather(*coros)
             self.assertEqual(res, fib10)
-            await asyncio.sleep(0.01, loop=self.loop)
+            await asyncio.sleep(0.01)
 
         fib10 = [fib(i) for i in range(10)]
         self.loop.run_until_complete(run())
 
+    @unittest.skipIf(
+        multiprocessing.get_start_method(False) == 'spawn',
+        'no need to test on macOS where spawn is used instead of fork')
     def test_executors_process_pool_01(self):
         self.run_pool_test(concurrent.futures.ProcessPoolExecutor)
 

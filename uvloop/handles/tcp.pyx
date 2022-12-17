@@ -1,8 +1,7 @@
 cdef __tcp_init_uv_handle(UVStream handle, Loop loop, unsigned int flags):
     cdef int err
 
-    handle._handle = <uv.uv_handle_t*> \
-                        PyMem_RawMalloc(sizeof(uv.uv_tcp_t))
+    handle._handle = <uv.uv_handle_t*>PyMem_RawMalloc(sizeof(uv.uv_tcp_t))
     if handle._handle is NULL:
         handle._abort_init()
         raise MemoryError()
@@ -58,20 +57,18 @@ cdef class TCPServer(UVStreamServer):
 
     @staticmethod
     cdef TCPServer new(Loop loop, object protocol_factory, Server server,
-                       object ssl, unsigned int flags):
+                       unsigned int flags,
+                       object backlog,
+                       object ssl,
+                       object ssl_handshake_timeout,
+                       object ssl_shutdown_timeout):
 
         cdef TCPServer handle
         handle = TCPServer.__new__(TCPServer)
-        handle._init(loop, protocol_factory, server, ssl)
+        handle._init(loop, protocol_factory, server, backlog,
+                     ssl, ssl_handshake_timeout, ssl_shutdown_timeout)
         __tcp_init_uv_handle(<UVStream>handle, loop, flags)
         return handle
-
-    cdef _set_nodelay(self):
-        cdef int err
-        self._ensure_alive()
-        err = uv.uv_tcp_nodelay(<uv.uv_tcp_t*>self._handle, 1);
-        if err < 0:
-            raise convert_error(err)
 
     cdef _new_socket(self):
         return __tcp_get_socket(<UVSocketHandle>self)
@@ -84,7 +81,6 @@ cdef class TCPServer(UVStreamServer):
             self._fatal_error(exc, True)
         else:
             self._mark_as_open()
-            self._set_nodelay()
 
     cdef bind(self, system.sockaddr* addr, unsigned int flags=0):
         self._ensure_alive()
@@ -94,11 +90,12 @@ cdef class TCPServer(UVStreamServer):
             self._fatal_error(exc, True)
         else:
             self._mark_as_open()
-            self._set_nodelay()
 
-    cdef UVStream _make_new_transport(self, object protocol, object waiter):
+    cdef UVStream _make_new_transport(self, object protocol, object waiter,
+                                      object context):
         cdef TCPTransport tr
-        tr = TCPTransport.new(self._loop, protocol, self._server, waiter)
+        tr = TCPTransport.new(self._loop, protocol, self._server, waiter,
+                              context)
         return <UVStream>tr
 
 
@@ -107,11 +104,11 @@ cdef class TCPTransport(UVStream):
 
     @staticmethod
     cdef TCPTransport new(Loop loop, object protocol, Server server,
-                            object waiter):
+                          object waiter, object context):
 
         cdef TCPTransport handle
         handle = TCPTransport.__new__(TCPTransport)
-        handle._init(loop, protocol, server, waiter)
+        handle._init(loop, protocol, server, waiter, context)
         __tcp_init_uv_handle(<UVStream>handle, loop, uv.AF_UNSPEC)
         handle.__peername_set = 0
         handle.__sockname_set = 0
@@ -121,7 +118,7 @@ cdef class TCPTransport(UVStream):
     cdef _set_nodelay(self):
         cdef int err
         self._ensure_alive()
-        err = uv.uv_tcp_nodelay(<uv.uv_tcp_t*>self._handle, 1);
+        err = uv.uv_tcp_nodelay(<uv.uv_tcp_t*>self._handle, 1)
         if err < 0:
             raise convert_error(err)
 
@@ -188,12 +185,10 @@ cdef class TCPTransport(UVStream):
 cdef class _TCPConnectRequest(UVRequest):
     cdef:
         TCPTransport transport
+        uv.uv_connect_t _req_data
 
     def __cinit__(self, loop, transport):
-        self.request = <uv.uv_req_t*> PyMem_RawMalloc(sizeof(uv.uv_connect_t))
-        if self.request is NULL:
-            self.on_done()
-            raise MemoryError()
+        self.request = <uv.uv_req_t*>&self._req_data
         self.request.data = <void*>self
         self.transport = transport
 
@@ -225,7 +220,6 @@ cdef void __tcp_connect_callback(uv.uv_connect_t* req, int status) with gil:
     try:
         transport._on_connect(exc)
     except BaseException as ex:
-        wrapper.transport._error(ex, False)
+        wrapper.transport._fatal_error(ex, False)
     finally:
         wrapper.on_done()
-

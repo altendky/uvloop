@@ -8,6 +8,7 @@ import contextlib
 import gc
 import logging
 import os
+import pprint
 import re
 import select
 import socket
@@ -68,30 +69,47 @@ class BaseTestCase(unittest.TestCase, metaclass=BaseTestCaseMeta):
     def new_loop(self):
         raise NotImplementedError
 
+    def new_policy(self):
+        raise NotImplementedError
+
     def mock_pattern(self, str):
         return MockPattern(str)
+
+    async def wait_closed(self, obj):
+        if not isinstance(obj, asyncio.StreamWriter):
+            return
+        try:
+            await obj.wait_closed()
+        except (BrokenPipeError, ConnectionError):
+            pass
 
     def is_asyncio_loop(self):
         return type(self.loop).__module__.startswith('asyncio.')
 
     def run_loop_briefly(self, *, delay=0.01):
-        self.loop.run_until_complete(asyncio.sleep(delay, loop=self.loop))
+        self.loop.run_until_complete(asyncio.sleep(delay))
+
+    def loop_exception_handler(self, loop, context):
+        self.__unhandled_exceptions.append(context)
+        self.loop.default_exception_handler(context)
 
     def setUp(self):
         self.loop = self.new_loop()
-        asyncio.set_event_loop(None)
+        asyncio.set_event_loop_policy(self.new_policy())
+        asyncio.set_event_loop(self.loop)
         self._check_unclosed_resources_in_debug = True
 
-        if hasattr(asyncio, '_get_running_loop'):
-            # Disable `_get_running_loop`.
-            self._get_running_loop = asyncio.events._get_running_loop
-            asyncio.events._get_running_loop = lambda: None
+        self.loop.set_exception_handler(self.loop_exception_handler)
+        self.__unhandled_exceptions = []
 
     def tearDown(self):
         self.loop.close()
 
-        if hasattr(asyncio, '_get_running_loop'):
-            asyncio.events._get_running_loop = self._get_running_loop
+        if self.__unhandled_exceptions:
+            print('Unexpected calls to loop.call_exception_handler():')
+            pprint.pprint(self.__unhandled_exceptions)
+            self.fail('unexpected calls to loop.call_exception_handler()')
+            return
 
         if not self._check_unclosed_resources_in_debug:
             return
@@ -138,6 +156,7 @@ class BaseTestCase(unittest.TestCase, metaclass=BaseTestCaseMeta):
                         'total != closed for {}'.format(h_name))
 
         asyncio.set_event_loop(None)
+        asyncio.set_event_loop_policy(None)
         self.loop = None
 
     def skip_unclosed_handles_check(self):
@@ -255,15 +274,19 @@ def find_free_port(start_from=50000):
 class SSLTestCase:
 
     def _create_server_ssl_context(self, certfile, keyfile=None):
-        sslcontext = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        if hasattr(ssl, 'PROTOCOL_TLS'):
+            sslcontext = ssl.SSLContext(ssl.PROTOCOL_TLS)
+        else:
+            sslcontext = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
         sslcontext.options |= ssl.OP_NO_SSLv2
         sslcontext.load_cert_chain(certfile, keyfile)
         return sslcontext
 
-    def _create_client_ssl_context(self):
+    def _create_client_ssl_context(self, *, disable_verify=True):
         sslcontext = ssl.create_default_context()
         sslcontext.check_hostname = False
-        sslcontext.verify_mode = ssl.CERT_NONE
+        if disable_verify:
+            sslcontext.verify_mode = ssl.CERT_NONE
         return sslcontext
 
     @contextlib.contextmanager
@@ -284,6 +307,9 @@ class UVTestCase(BaseTestCase):
 
     def new_loop(self):
         return uvloop.new_event_loop()
+
+    def new_policy(self):
+        return uvloop.EventLoopPolicy()
 
 
 class AIOTestCase(BaseTestCase):
@@ -311,6 +337,9 @@ class AIOTestCase(BaseTestCase):
             return asyncio.ProactorEventLoop()
         else:
             return asyncio.new_event_loop()
+
+    def new_policy(self):
+        return asyncio.DefaultEventLoopPolicy()
 
 
 def has_IPv6():
@@ -400,7 +429,9 @@ class TestThreadedClient(SocketThread):
     def run(self):
         try:
             self._prog(TestSocketWrapper(self._sock))
-        except Exception as ex:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as ex:
             self._test._abort_socket_test(ex)
 
 
@@ -470,7 +501,9 @@ class TestThreadedServer(SocketThread):
                     try:
                         with conn:
                             self._handle_client(conn)
-                    except Exception as ex:
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException as ex:
                         self._active = False
                         try:
                             raise
@@ -483,3 +516,46 @@ class TestThreadedServer(SocketThread):
     @property
     def addr(self):
         return self._sock.getsockname()
+
+
+###############################################################################
+# A few helpers from asyncio/tests/testutils.py
+###############################################################################
+
+
+def run_briefly(loop):
+    async def once():
+        pass
+    gen = once()
+    t = loop.create_task(gen)
+    # Don't log a warning if the task is not done after run_until_complete().
+    # It occurs if the loop is stopped or if a task raises a BaseException.
+    t._log_destroy_pending = False
+    try:
+        loop.run_until_complete(t)
+    finally:
+        gen.close()
+
+
+def run_until(loop, pred, timeout=30):
+    deadline = time.time() + timeout
+    while not pred():
+        if timeout is not None:
+            timeout = deadline - time.time()
+            if timeout <= 0:
+                raise asyncio.futures.TimeoutError()
+        loop.run_until_complete(asyncio.tasks.sleep(0.001))
+
+
+@contextlib.contextmanager
+def disable_logger():
+    """Context manager to disable asyncio logger.
+
+    For example, it can be used to ignore warnings in debug mode.
+    """
+    old_level = asyncio.log.logger.level
+    try:
+        asyncio.log.logger.setLevel(logging.CRITICAL + 1)
+        yield
+    finally:
+        asyncio.log.logger.setLevel(old_level)

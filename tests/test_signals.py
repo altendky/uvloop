@@ -3,6 +3,8 @@ import signal
 import subprocess
 import sys
 import time
+import unittest
+import uvloop
 
 from uvloop import _testbase as tb
 
@@ -40,10 +42,9 @@ run()
 """
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, b'-c', PROG,
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                loop=self.loop)
+                stderr=subprocess.PIPE)
 
             await proc.stdout.readline()
             time.sleep(DELAY)
@@ -86,10 +87,9 @@ run()
 """
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, b'-c', PROG,
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                loop=self.loop)
+                stderr=subprocess.PIPE)
 
             await proc.stdout.readline()
             time.sleep(DELAY)
@@ -127,10 +127,48 @@ finally:
 """
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, b'-c', PROG,
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                loop=self.loop)
+                stderr=subprocess.PIPE)
+
+            await proc.stdout.readline()
+            time.sleep(DELAY)
+            proc.send_signal(signal.SIGINT)
+            out, err = await proc.communicate()
+            self.assertIn(b'KeyboardInterrupt', err)
+
+        self.loop.run_until_complete(runner())
+
+    @tb.silence_long_exec_warning()
+    def test_signals_sigint_uvcode_two_loop_runs(self):
+        async def runner():
+            PROG = R"""\
+import asyncio
+import uvloop
+
+srv = None
+
+async def worker():
+    global srv
+    cb = lambda *args: None
+    srv = await asyncio.start_server(cb, '127.0.0.1', 0)
+
+loop = """ + self.NEW_LOOP + """
+asyncio.set_event_loop(loop)
+loop.run_until_complete(worker())
+print('READY', flush=True)
+try:
+    loop.run_forever()
+finally:
+    srv.close()
+    loop.run_until_complete(srv.wait_closed())
+    loop.close()
+"""
+
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE)
 
             await proc.stdout.readline()
             time.sleep(DELAY)
@@ -177,10 +215,9 @@ finally:
 """
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, b'-c', PROG,
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                loop=self.loop)
+                stderr=subprocess.PIPE)
 
             await proc.stdout.readline()
             time.sleep(DELAY)
@@ -236,10 +273,9 @@ finally:
 """
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, b'-c', PROG,
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                loop=self.loop)
+                stderr=subprocess.PIPE)
 
             await proc.stdout.readline()
 
@@ -270,13 +306,112 @@ finally:
             self.loop.add_signal_handler(signal.SIGKILL, lambda *a: None)
 
     def test_signals_coro_callback(self):
-        async def coro(): pass
+        async def coro():
+            pass
         with self.assertRaisesRegex(TypeError, 'coroutines cannot be used'):
             self.loop.add_signal_handler(signal.SIGHUP, coro)
+
+    def test_signals_wakeup_fd_unchanged(self):
+        async def runner():
+            PROG = R"""\
+import uvloop
+import signal
+import asyncio
+
+
+def get_wakeup_fd():
+    fd = signal.set_wakeup_fd(-1)
+    signal.set_wakeup_fd(fd)
+    return fd
+
+async def f(): pass
+
+fd0 = get_wakeup_fd()
+loop = """ + self.NEW_LOOP + """
+try:
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(f())
+    fd1 = get_wakeup_fd()
+finally:
+    loop.close()
+
+print(fd0 == fd1, flush=True)
+
+"""
+
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE)
+
+            out, err = await proc.communicate()
+            self.assertEqual(err, b'')
+            self.assertIn(b'True', out)
+
+        self.loop.run_until_complete(runner())
+
+    def test_signals_fork_in_thread(self):
+        # Refs #452, when forked from a thread, the main-thread-only signal
+        # operations failed thread ID checks because we didn't update
+        # MAIN_THREAD_ID after fork. It's now a lazy value set when needed and
+        # cleared after fork.
+        PROG = R"""\
+import asyncio
+import multiprocessing
+import signal
+import sys
+import threading
+import uvloop
+
+multiprocessing.set_start_method('fork')
+
+def subprocess():
+    loop = """ + self.NEW_LOOP + """
+    loop.add_signal_handler(signal.SIGINT, lambda *a: None)
+
+def run():
+    loop = """ + self.NEW_LOOP + """
+    loop.add_signal_handler(signal.SIGINT, lambda *a: None)
+    p = multiprocessing.Process(target=subprocess)
+    t = threading.Thread(target=p.start)
+    t.start()
+    t.join()
+    p.join()
+    sys.exit(p.exitcode)
+
+run()
+"""
+
+        subprocess.check_call([
+            sys.executable, b'-W', b'ignore', b'-c', PROG,
+        ])
 
 
 class Test_UV_Signals(_TestSignal, tb.UVTestCase):
     NEW_LOOP = 'uvloop.new_event_loop()'
+
+    def test_signals_no_SIGCHLD(self):
+        with self.assertRaisesRegex(RuntimeError,
+                                    r"cannot add.*handler.*SIGCHLD"):
+
+            self.loop.add_signal_handler(signal.SIGCHLD, lambda *a: None)
+
+    @unittest.skipIf(sys.version_info[:3] >= (3, 8, 0),
+                     'in 3.8 a ThreadedChildWatcher is used '
+                     '(does not rely on SIGCHLD)')
+    def test_asyncio_add_watcher_SIGCHLD_nop(self):
+        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+        asyncio.get_event_loop_policy().get_child_watcher()
+
+        try:
+            loop = uvloop.new_event_loop()
+            with self.assertWarnsRegex(
+                    RuntimeWarning,
+                    "asyncio is trying to install its ChildWatcher"):
+                asyncio.set_event_loop(loop)
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
 
 
 class Test_AIO_Signals(_TestSignal, tb.AIOTestCase):

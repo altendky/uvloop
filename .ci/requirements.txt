@@ -1,4 +1,0 @@
-cython==0.27.3
-aiohttp
-tinys3
-twine

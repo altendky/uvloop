@@ -7,9 +7,20 @@ cdef class UVProcess(UVHandle):
         self.uv_opt_args = NULL
         self._returncode = None
         self._pid = None
-        self._fds_to_close = set()
+        self._fds_to_close = list()
         self._preexec_fn = None
         self._restore_signals = True
+        self.context = Context_CopyCurrent()
+
+    cdef _close_process_handle(self):
+        # XXX: This is a workaround for a libuv bug:
+        # - https://github.com/libuv/libuv/issues/1933
+        # - https://github.com/libuv/libuv/pull/551
+        if self._handle is NULL:
+            return
+        self._handle.data = NULL
+        uv.uv_close(self._handle, __uv_close_process_handle_cb)
+        self._handle = NULL  # close callback will free() the memory
 
     cdef _init(self, Loop loop, list args, dict env,
                cwd, start_new_session,
@@ -18,13 +29,14 @@ cdef class UVProcess(UVHandle):
 
         global __forking
         global __forking_loop
+        global __forkHandler
 
         cdef int err
 
         self._start_init(loop)
 
-        self._handle = <uv.uv_handle_t*> \
-                            PyMem_RawMalloc(sizeof(uv.uv_process_t))
+        self._handle = <uv.uv_handle_t*>PyMem_RawMalloc(
+            sizeof(uv.uv_process_t))
         if self._handle is NULL:
             self._abort_init()
             raise MemoryError()
@@ -44,7 +56,7 @@ cdef class UVProcess(UVHandle):
                     if not os_get_inheritable(fd):
                         restore_inheritable.add(fd)
                         os_set_inheritable(fd, True)
-        except:
+        except Exception:
             self._abort_init()
             raise
 
@@ -57,6 +69,11 @@ cdef class UVProcess(UVHandle):
                 'Racing with another loop to spawn a process.')
 
         self._errpipe_read, self._errpipe_write = os_pipe()
+        fds_to_close = self._fds_to_close
+        self._fds_to_close = None
+        fds_to_close.append(self._errpipe_read)
+        # add the write pipe last so we can close it early
+        fds_to_close.append(self._errpipe_write)
         try:
             os_set_inheritable(self._errpipe_write, True)
 
@@ -66,8 +83,9 @@ cdef class UVProcess(UVHandle):
             loop.active_process_handler = self
             __forking = 1
             __forking_loop = loop
+            system.setForkHandler(<system.OnForkHandler>&__get_fork_handler)
 
-            _PyImport_AcquireLock()
+            PyOS_BeforeFork()
 
             err = uv.uv_spawn(loop.uvloop,
                               <uv.uv_process_t*>self._handle,
@@ -75,20 +93,20 @@ cdef class UVProcess(UVHandle):
 
             __forking = 0
             __forking_loop = None
+            system.resetForkHandler()
             loop.active_process_handler = None
 
-            if _PyImport_ReleaseLock() < 0:
-                # See CPython/posixmodule.c for details
-                self._abort_init()
-                raise RuntimeError('not holding the import lock')
+            PyOS_AfterFork_Parent()
 
             if err < 0:
+                self._close_process_handle()
                 self._abort_init()
                 raise convert_error(err)
 
             self._finish_init()
 
-            os_close(self._errpipe_write)
+            # close the write pipe early
+            os_close(fds_to_close.pop())
 
             if preexec_fn is not None:
                 errpipe_data = bytearray()
@@ -102,25 +120,24 @@ cdef class UVProcess(UVHandle):
                         break
 
         finally:
-            os_close(self._errpipe_read)
-            try:
-                os_close(self._errpipe_write)
-            except OSError:
-                # Might be already closed
-                pass
+            while fds_to_close:
+                os_close(fds_to_close.pop())
+
+            for fd in restore_inheritable:
+                os_set_inheritable(fd, False)
 
         # asyncio caches the PID in BaseSubprocessTransport,
         # so that the transport knows what the PID was even
         # after the process is finished.
         self._pid = (<uv.uv_process_t*>self._handle).pid
 
-        for fd in restore_inheritable:
-            os_set_inheritable(fd, False)
-
-        fds_to_close = self._fds_to_close
-        self._fds_to_close = None
-        for fd in fds_to_close:
-            os_close(fd)
+        # Track the process handle (create a strong ref to it)
+        # to guarantee that __dealloc__ doesn't happen in an
+        # uncontrolled fashion.  We want to wait until the process
+        # exits and libuv calls __uvprocess_on_exit_callback,
+        # which will call `UVProcess._close()`, which will, in turn,
+        # untrack this handle.
+        self._loop._track_process(self)
 
         if debug_flags & __PROCESS_DEBUG_SLEEP_AFTER_FORK:
             time_sleep(1)
@@ -132,7 +149,7 @@ cdef class UVProcess(UVHandle):
                 exc_name, exc_msg = errpipe_data.split(b':', 1)
                 exc_name = exc_name.decode()
                 exc_msg = exc_msg.decode()
-            except:
+            except Exception:
                 self._close()
                 raise subprocess_SubprocessError(
                     'Bad exception data from child: {!r}'.format(
@@ -153,7 +170,7 @@ cdef class UVProcess(UVHandle):
         if self._restore_signals:
             _Py_RestoreSignals()
 
-        PyOS_AfterFork()
+        PyOS_AfterFork_Child()
 
         err = uv.uv_loop_fork(self._loop.uvloop)
         if err < 0:
@@ -171,6 +188,7 @@ cdef class UVProcess(UVHandle):
                         f.write(str(ex.args[0]).encode())
                 finally:
                     system._exit(255)
+                    return
             else:
                 os_close(self._errpipe_write)
         else:
@@ -180,7 +198,7 @@ cdef class UVProcess(UVHandle):
         if self._fds_to_close is None:
             raise RuntimeError(
                 'UVProcess._close_after_spawn called after uv_spawn')
-        self._fds_to_close.add(fd)
+        self._fds_to_close.append(fd)
 
     def __dealloc__(self):
         if self.uv_opt_env is not NULL:
@@ -194,13 +212,10 @@ cdef class UVProcess(UVHandle):
     cdef char** __to_cstring_array(self, list arr):
         cdef:
             int i
-            int arr_len = len(arr)
+            ssize_t arr_len = len(arr)
             bytes el
 
             char **ret
-
-        if UVLOOP_DEBUG:
-            assert arr_len > 0
 
         ret = <char **>PyMem_RawMalloc((arr_len + 1) * sizeof(char *))
         if ret is NULL:
@@ -208,7 +223,7 @@ cdef class UVProcess(UVHandle):
 
         for i in range(arr_len):
             el = arr[i]
-            # NB: PyBytes_AsSptring doesn't copy the data;
+            # NB: PyBytes_AsString doesn't copy the data;
             # we have to be careful when the "arr" is GCed,
             # and it shouldn't be ever mutated.
             ret[i] = PyBytes_AsString(el)
@@ -232,14 +247,7 @@ cdef class UVProcess(UVHandle):
             self.options.flags |= uv.UV_PROCESS_DETACHED
 
         if cwd is not None:
-            try:
-                # Lookup __fspath__ manually, as os.fspath() isn't
-                # available on Python 3.5.
-                fspath = type(cwd).__fspath__
-            except AttributeError:
-                pass
-            else:
-                cwd = fspath(cwd)
+            cwd = os_fspath(cwd)
 
             if isinstance(cwd, str):
                 cwd = PyUnicode_EncodeFSDefault(cwd)
@@ -263,7 +271,7 @@ cdef class UVProcess(UVHandle):
 
         self.__args = args.copy()
         for i in range(an):
-            arg = args[i]
+            arg = os_fspath(args[i])
             if isinstance(arg, str):
                 self.__args[i] = PyUnicode_EncodeFSDefault(arg)
             elif not isinstance(arg, bytes):
@@ -274,7 +282,7 @@ cdef class UVProcess(UVHandle):
         self.uv_opt_args = self.__to_cstring_array(self.__args)
 
     cdef _init_env(self, dict env):
-        if env is not None and len(env):
+        if env is not None:
             self.__env = list()
             for key in env:
                 val = env[key]
@@ -318,6 +326,13 @@ cdef class UVProcess(UVHandle):
 
         self._close()
 
+    cdef _close(self):
+        try:
+            if self._loop is not None:
+                self._loop._untrack_process(self)
+        finally:
+            UVHandle._close(self)
+
 
 DEF _CALL_PIPE_DATA_RECEIVED = 0
 DEF _CALL_PIPE_CONNECTION_LOST = 1
@@ -344,7 +359,8 @@ cdef class UVProcessTransport(UVProcess):
         UVProcess._on_exit(self, exit_status, term_signal)
 
         if self._stdio_ready:
-            self._loop.call_soon(self._protocol.process_exited)
+            self._loop.call_soon(self._protocol.process_exited,
+                                 context=self.context)
         else:
             self._pending_calls.append((_CALL_PROCESS_EXITED, None, None))
 
@@ -355,20 +371,24 @@ cdef class UVProcessTransport(UVProcess):
                 waiter.set_result(self._returncode)
         self._exit_waiters.clear()
 
+        self._close()
+
     cdef _check_proc(self):
         if not self._is_alive() or self._returncode is not None:
             raise ProcessLookupError()
 
     cdef _pipe_connection_lost(self, int fd, exc):
         if self._stdio_ready:
-            self._loop.call_soon(self._protocol.pipe_connection_lost, fd, exc)
+            self._loop.call_soon(self._protocol.pipe_connection_lost, fd, exc,
+                                 context=self.context)
             self._try_finish()
         else:
             self._pending_calls.append((_CALL_PIPE_CONNECTION_LOST, fd, exc))
 
     cdef _pipe_data_received(self, int fd, data):
         if self._stdio_ready:
-            self._loop.call_soon(self._protocol.pipe_data_received, fd, data)
+            self._loop.call_soon(self._protocol.pipe_data_received, fd, data,
+                                 context=self.context)
         else:
             self._pending_calls.append((_CALL_PIPE_DATA_RECEIVED, fd, data))
 
@@ -408,7 +428,7 @@ cdef class UVProcessTransport(UVProcess):
 
         if _stdin is not None:
             if _stdin == subprocess_PIPE:
-                r, w  = self._file_inpipe()
+                r, w = self._file_inpipe()
                 io[0] = r
 
                 self.stdin_proto = WriteSubprocessPipeProto(self, 0)
@@ -424,10 +444,9 @@ cdef class UVProcessTransport(UVProcess):
                 raise ValueError(
                     'subprocess.STDOUT is supported only by stderr parameter')
             else:
-                raise ValueError(
-                    'invalid stdin argument value {!r}'.format(_stdin))
+                io[0] = self._file_redirect_stdio(_stdin)
         else:
-            io[0] = self._file_redirect_stdio(sys.stdin.fileno())
+            io[0] = self._file_redirect_stdio(0)
 
         if _stdout is not None:
             if _stdout == subprocess_PIPE:
@@ -437,7 +456,7 @@ cdef class UVProcessTransport(UVProcess):
                 # streams API. Therefore, we create pipes for stdout and
                 # stderr manually.
 
-                r, w  = self._file_outpipe()
+                r, w = self._file_outpipe()
                 io[1] = w
 
                 self.stdout_proto = ReadSubprocessPipeProto(self, 1)
@@ -453,14 +472,13 @@ cdef class UVProcessTransport(UVProcess):
                 raise ValueError(
                     'subprocess.STDOUT is supported only by stderr parameter')
             else:
-                raise ValueError(
-                    'invalid stdout argument value {!r}'.format(_stdout))
+                io[1] = self._file_redirect_stdio(_stdout)
         else:
-            io[1] = self._file_redirect_stdio(sys.stdout.fileno())
+            io[1] = self._file_redirect_stdio(1)
 
         if _stderr is not None:
             if _stderr == subprocess_PIPE:
-                r, w  = self._file_outpipe()
+                r, w = self._file_outpipe()
                 io[2] = w
 
                 self.stderr_proto = ReadSubprocessPipeProto(self, 2)
@@ -475,29 +493,30 @@ cdef class UVProcessTransport(UVProcess):
                     # shouldn't ever happen
                     raise RuntimeError('cannot apply subprocess.STDOUT')
 
-                newfd = os_dup(io[1])
-                os_set_inheritable(newfd, True)
-                self._close_after_spawn(newfd)
-                io[2] = newfd
+                io[2] = self._file_redirect_stdio(io[1])
             elif _stderr == subprocess_DEVNULL:
                 io[2] = self._file_devnull()
             else:
-                raise ValueError(
-                    'invalid stderr argument value {!r}'.format(_stderr))
+                io[2] = self._file_redirect_stdio(_stderr)
         else:
-            io[2] = self._file_redirect_stdio(sys.stderr.fileno())
+            io[2] = self._file_redirect_stdio(2)
 
         assert len(io) == 3
         for idx in range(3):
+            iocnt = &self.iocnt[idx]
             if io[idx] is not None:
-                iocnt = &self.iocnt[idx]
                 iocnt.flags = uv.UV_INHERIT_FD
                 iocnt.data.fd = io[idx]
+            else:
+                iocnt.flags = uv.UV_IGNORE
 
     cdef _call_connection_made(self, waiter):
         try:
+            # we're always called in the right context, so just call the user's
             self._protocol.connection_made(self)
-        except Exception as ex:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as ex:
             if waiter is not None and not waiter.cancelled():
                 waiter.set_exception(ex)
             else:
@@ -525,13 +544,17 @@ cdef class UVProcessTransport(UVProcess):
             return
 
         if ((self.stdin_proto is None or self.stdin_proto.disconnected) and
-            (self.stdout_proto is None or self.stdout_proto.disconnected) and
-            (self.stderr_proto is None or self.stderr_proto.disconnected)):
+                (self.stdout_proto is None or
+                    self.stdout_proto.disconnected) and
+                (self.stderr_proto is None or
+                    self.stderr_proto.disconnected)):
 
             self._finished = 1
 
             if self._stdio_ready:
-                self._loop.call_soon(self._protocol.connection_lost, None)
+                # copy self.context for simplicity
+                self._loop.call_soon(self._protocol.connection_lost, None,
+                                     context=self.context)
             else:
                 self._pending_calls.append((_CALL_CONNECTION_LOST, None, None))
 
@@ -547,6 +570,7 @@ cdef class UVProcessTransport(UVProcess):
                 new_MethodHandle1(self._loop,
                                   "UVProcessTransport._call_connection_made",
                                   <method1_t>self._call_connection_made,
+                                  None,  # means to copy the current context
                                   self, waiter))
 
     @staticmethod
@@ -572,7 +596,9 @@ cdef class UVProcessTransport(UVProcess):
 
         if handle._init_futs:
             handle._stdio_ready = 0
-            init_fut = aio_gather(*handle._init_futs, loop=loop)
+            init_fut = aio_gather(*handle._init_futs)
+            # add_done_callback will copy the current context and run the
+            # callback within the context
             init_fut.add_done_callback(
                 ft_partial(handle.__stdio_inited, waiter))
         else:
@@ -581,6 +607,7 @@ cdef class UVProcessTransport(UVProcess):
                 new_MethodHandle1(loop,
                                   "UVProcessTransport._call_connection_made",
                                   <method1_t>handle._call_connection_made,
+                                  None,  # means to copy the current context
                                   handle, waiter))
 
         return handle
@@ -631,7 +658,14 @@ cdef class UVProcessTransport(UVProcess):
         if self._stderr is not None:
             self._stderr.close()
 
-        self._close()
+        if self._returncode is not None:
+            # The process is dead, just close the UV handle.
+            #
+            # (If "self._returncode is None", the process should have been
+            # killed already and we're just waiting for a SIGCHLD; after
+            # which the transport will be GC'ed and the uvhandle will be
+            # closed in UVHandle.__dealloc__.)
+            self._close()
 
     def get_extra_info(self, name, default=None):
         return default
@@ -725,3 +759,7 @@ cdef __socketpair():
     os_set_inheritable(fds[1], False)
 
     return fds[0], fds[1]
+
+
+cdef void __uv_close_process_handle_cb(uv.uv_handle_t* handle) with gil:
+    PyMem_RawFree(handle)

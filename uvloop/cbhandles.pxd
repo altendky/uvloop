@@ -1,6 +1,7 @@
 cdef class Handle:
     cdef:
         Loop loop
+        object context
         bint _cancelled
 
         str meth_name
@@ -13,6 +14,8 @@ cdef class Handle:
         readonly _source_traceback
 
     cdef inline _set_loop(self, Loop loop)
+    cdef inline _set_context(self, object context)
+
     cdef inline _run(self)
     cdef _cancel(self)
 
@@ -21,13 +24,15 @@ cdef class Handle:
 
 cdef class TimerHandle:
     cdef:
-        object callback, args
+        object callback
+        tuple args
         bint _cancelled
         UVTimer timer
         Loop loop
+        object context
+        tuple _debug_info
         object __weakref__
-
-        readonly _source_traceback
+        object _when
 
     cdef _run(self)
     cdef _cancel(self)

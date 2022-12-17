@@ -5,8 +5,7 @@ cdef class UVPoll(UVHandle):
 
         self._start_init(loop)
 
-        self._handle = <uv.uv_handle_t*> \
-                            PyMem_RawMalloc(sizeof(uv.uv_poll_t))
+        self._handle = <uv.uv_handle_t*>PyMem_RawMalloc(sizeof(uv.uv_poll_t))
         if self._handle is NULL:
             self._abort_init()
             raise MemoryError()
@@ -87,6 +86,9 @@ cdef class UVPoll(UVHandle):
 
     cdef is_reading(self):
         return self._is_alive() and self.reading_handle is not None
+
+    cdef is_writing(self):
+        return self._is_alive() and self.writing_handle is not None
 
     cdef start_reading(self, Handle callback):
         cdef:

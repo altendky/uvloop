@@ -1,10 +1,13 @@
 cdef class TCPServer(UVStreamServer):
     cdef bind(self, system.sockaddr* addr, unsigned int flags=*)
-    cdef _set_nodelay(self)
 
     @staticmethod
     cdef TCPServer new(Loop loop, object protocol_factory, Server server,
-                       object ssl, unsigned int flags)
+                       unsigned int flags,
+                       object backlog,
+                       object ssl,
+                       object ssl_handshake_timeout,
+                       object ssl_shutdown_timeout)
 
 
 cdef class TCPTransport(UVStream):
@@ -20,4 +23,4 @@ cdef class TCPTransport(UVStream):
 
     @staticmethod
     cdef TCPTransport new(Loop loop, object protocol, Server server,
-                          object waiter)
+                          object waiter, object context)

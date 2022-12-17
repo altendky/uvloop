@@ -1,8 +1,12 @@
-.. image:: https://travis-ci.org/MagicStack/uvloop.svg?branch=master
-    :target: https://travis-ci.org/MagicStack/uvloop
+.. image:: https://img.shields.io/github/workflow/status/MagicStack/uvloop/Tests
+    :target: https://github.com/MagicStack/uvloop/actions?query=workflow%3ATests+branch%3Amaster
 
 .. image:: https://img.shields.io/pypi/v/uvloop.svg
     :target: https://pypi.python.org/pypi/uvloop
+
+.. image:: https://pepy.tech/badge/uvloop
+    :target: https://pepy.tech/project/uvloop
+    :alt: PyPI - Downloads
 
 
 uvloop is a fast, drop-in replacement of the built-in asyncio
@@ -19,7 +23,7 @@ Performance
 
 uvloop makes asyncio 2-4x faster.
 
-.. image:: performance.png
+.. image:: https://raw.githubusercontent.com/MagicStack/uvloop/master/performance.png
     :target: http://magic.io/blog/uvloop-blazing-fast-python-networking/
 
 The above chart shows the performance of an echo server with different
@@ -27,54 +31,78 @@ message sizes.  The *sockets* benchmark uses ``loop.sock_recv()`` and
 ``loop.sock_sendall()`` methods; the *streams* benchmark uses asyncio
 high-level streams, created by the ``asyncio.start_server()`` function;
 and the *protocol* benchmark uses ``loop.create_server()`` with a simple
-echo protocol.  Read more about uvloop
-`performance <http://magic.io/blog/uvloop-blazing-fast-python-networking/>`_.
+echo protocol.  Read more about uvloop in a
+`blog post <http://magic.io/blog/uvloop-blazing-fast-python-networking/>`_
+about it.
 
 
 Installation
 ------------
 
-uvloop requires Python 3.5 and is available on PyPI.
+uvloop requires Python 3.7 or greater and is available on PyPI.
 Use pip to install it::
 
     $ pip install uvloop
+
+Note that it is highly recommended to **upgrade pip before** installing
+uvloop with::
+
+    $ pip install -U pip
 
 
 Using uvloop
 ------------
 
-To make asyncio use uvloop, you can install the uvloop event
-loop policy:
-
 .. code:: python
 
     import asyncio
+    import sys
+
     import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-Alternatively, you can create an instance of the loop
-manually, using:
+    async def main():
+        # Main entry-point.
+        ...
 
-.. code:: python
+    if sys.version_info >= (3, 11):
+        with asyncio.Runner(loop_factory=uvloop.new_event_loop) as runner:
+            runner.run(main())
+    else:
+        uvloop.install()
+        asyncio.run(main())
 
-    loop = uvloop.new_event_loop()
-    asyncio.set_event_loop(loop)
 
+Building From Source
+--------------------
 
-Development of uvloop
----------------------
+To build uvloop, you'll need Python 3.7 or greater:
 
-To build uvloop, you'll need Cython and Python 3.5.  The best way
-is to create a virtual env, so that you'll have ``cython`` and
-``python`` commands pointing to the correct tools.
+1. Clone the repository:
 
-1. ``git clone --recursive git@github.com:MagicStack/uvloop.git``
+   .. code::
 
-2. ``cd uvloop``
+    $ git clone --recursive git@github.com:MagicStack/uvloop.git
+    $ cd uvloop
 
-3. ``make``
+2. Create a virtual environment and activate it:
 
-4. ``make test``
+   .. code::
+
+    $ python3.7 -m venv uvloop-dev
+    $ source uvloop-dev/bin/activate
+
+3. Install development dependencies:
+
+   ..  code::
+
+    $ pip install -e .[dev]
+
+4. Build and run tests:
+
+   .. code::
+
+    $ make
+    $ make test
 
 
 License

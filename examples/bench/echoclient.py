@@ -3,10 +3,10 @@
 
 
 import argparse
+import concurrent.futures
+import socket
+import ssl
 import time
-
-from concurrent.futures import ProcessPoolExecutor
-from socket import *
 
 
 if __name__ == '__main__':
@@ -23,7 +23,19 @@ if __name__ == '__main__':
                         help='number of workers')
     parser.add_argument('--addr', default='127.0.0.1:25000', type=str,
                         help='address:port of echoserver')
+    parser.add_argument('--ssl', default=False, action='store_true')
     args = parser.parse_args()
+
+    client_context = None
+    if args.ssl:
+        print('with SSL')
+        if hasattr(ssl, 'PROTOCOL_TLS'):
+            client_context = ssl.SSLContext(ssl.PROTOCOL_TLS)
+        else:
+            client_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        if hasattr(client_context, 'check_hostname'):
+            client_context.check_hostname = False
+        client_context.verify_mode = ssl.CERT_NONE
 
     unix = False
     if args.addr.startswith('file:'):
@@ -38,7 +50,7 @@ if __name__ == '__main__':
     MSGSIZE = args.msize
     REQSIZE = MSGSIZE * args.mpr
 
-    msg = b'x'*(MSGSIZE - 1) + b'\n'
+    msg = b'x' * (MSGSIZE - 1) + b'\n'
     if args.mpr:
         msg *= args.mpr
 
@@ -48,16 +60,20 @@ if __name__ == '__main__':
             n //= args.mpr
 
         if unix:
-            sock = socket(AF_UNIX, SOCK_STREAM)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         else:
-            sock = socket(AF_INET, SOCK_STREAM)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
         try:
-            sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except (OSError, NameError):
             pass
 
+        if client_context:
+            sock = client_context.wrap_socket(sock)
+
         sock.connect(addr)
+
         while n > 0:
             sock.sendall(msg)
             nrecv = 0
@@ -73,10 +89,10 @@ if __name__ == '__main__':
     NMESSAGES = args.num
     start = time.time()
     for _ in range(TIMES):
-        with ProcessPoolExecutor(max_workers=N) as e:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=N) as e:
             for _ in range(N):
                 e.submit(run_test, NMESSAGES)
     end = time.time()
-    duration = end-start
-    print(NMESSAGES*N*TIMES,'in', duration)
-    print(NMESSAGES*N*TIMES/duration, 'requests/sec')
+    duration = end - start
+    print(NMESSAGES * N * TIMES, 'in', duration)
+    print(NMESSAGES * N * TIMES / duration, 'requests/sec')

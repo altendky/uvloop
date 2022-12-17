@@ -2,9 +2,7 @@ import argparse
 import asyncio
 import gc
 import os.path
-import socket as socket_module
-
-from socket import *
+import socket as stdsock
 
 
 PRINT = 0
@@ -13,7 +11,8 @@ PRINT = 0
 async def echo_client_streams(reader, writer):
     sock = writer.get_extra_info('socket')
     try:
-        sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
+        sock.setsockopt(
+            stdsock.IPPROTO_TCP, stdsock.TCP_NODELAY, 1)
     except (OSError, NameError):
         pass
     if PRINT:
@@ -32,7 +31,7 @@ async def print_debug(loop):
     while True:
         print(chr(27) + "[2J")  # clear screen
         loop.print_debug_info()
-        await asyncio.sleep(0.5, loop=loop)
+        await asyncio.sleep(0.5)
 
 
 if __name__ == '__main__':
@@ -77,10 +76,10 @@ if __name__ == '__main__':
     print('using asyncio/streams')
     if unix:
         coro = asyncio.start_unix_server(echo_client_streams,
-                                         addr, loop=loop, limit=256000)
+                                         addr, limit=256000)
     else:
         coro = asyncio.start_server(echo_client_streams,
-                                    *addr, loop=loop, limit=256000)
+                                    *addr, limit=256000)
     srv = loop.run_until_complete(coro)
 
     try:

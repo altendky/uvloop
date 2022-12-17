@@ -3,11 +3,21 @@ from posix.types cimport gid_t, uid_t
 
 from . cimport system
 
+# This is an internal enum UV_HANDLE_READABLE from uv-common.h, used only by
+# handles/pipe.pyx to temporarily workaround a libuv issue libuv/libuv#2058,
+# before there is a proper fix in libuv. In short, libuv disallowed feeding a
+# write-only pipe to uv_read_start(), which was needed by uvloop to detect a
+# broken pipe without having to send anything on the write-only end. We're
+# setting UV_HANDLE_READABLE on pipe_t to workaround this limitation
+# temporarily, please see also #317.
+cdef enum:
+    UV_INTERNAL_HANDLE_READABLE = 0x00004000
 
-cdef extern from "includes/compat.h" nogil:
-    # Member of uv_poll_event, in compat.h for compatibility
-    # with libuv < v1.9.0
-    cdef int UV_DISCONNECT
+# TODO: altendky is this still needed?
+# cdef extern from "includes/compat.h" nogil:
+#     # Member of uv_poll_event, in compat.h for compatibility
+#     # with libuv < v1.9.0
+#     cdef int UV_DISCONNECT
 
 
 cdef extern from "uv.h" nogil:
@@ -33,6 +43,7 @@ cdef extern from "uv.h" nogil:
     cdef int UV_ESRCH
     cdef int UV_ETIMEDOUT
     cdef int UV_EBADF
+    cdef int UV_ENOBUFS
 
     cdef int UV_EAI_ADDRFAMILY
     cdef int UV_EAI_AGAIN
@@ -68,6 +79,7 @@ cdef extern from "uv.h" nogil:
 
     cdef int SIGINT
     cdef int SIGHUP
+    cdef int SIGCHLD
     cdef int SIGKILL
     cdef int SIGTERM
 
@@ -76,8 +88,8 @@ cdef extern from "uv.h" nogil:
     ctypedef int uv_os_fd_t
 
     ctypedef struct uv_buf_t:
-      char* base
-      size_t len
+        char* base
+        size_t len
 
     ctypedef struct uv_loop_t:
         void* data
@@ -86,6 +98,7 @@ cdef extern from "uv.h" nogil:
     ctypedef struct uv_handle_t:
         void* data
         uv_loop_t* loop
+        unsigned int flags
         # ...
 
     ctypedef struct uv_idle_t:
@@ -129,6 +142,17 @@ cdef extern from "uv.h" nogil:
         uv_loop_t* loop
         # ...
 
+    ctypedef struct uv_udp_t:
+        void* data
+        uv_loop_t* loop
+        size_t send_queue_size
+        size_t send_queue_count
+        # ...
+
+    ctypedef struct uv_udp_send_t:
+        void* data
+        uv_udp_t* handle
+
     ctypedef struct uv_poll_t:
         void* data
         uv_loop_t* loop
@@ -166,6 +190,10 @@ cdef extern from "uv.h" nogil:
         int pid
         # ...
 
+    ctypedef struct uv_fs_event_t:
+        void* data
+        # ...
+
     ctypedef enum uv_req_type:
         UV_UNKNOWN_REQ = 0,
         UV_REQ,
@@ -187,12 +215,20 @@ cdef extern from "uv.h" nogil:
 
     ctypedef enum uv_poll_event:
         UV_READABLE = 1,
-        UV_WRITABLE = 2
-        # UV_DISCONNECT = 4 ; see compat.h for details
+        UV_WRITABLE = 2,
+        UV_DISCONNECT = 4
+
+    ctypedef enum uv_udp_flags:
+        UV_UDP_IPV6ONLY = 1,
+        UV_UDP_PARTIAL = 2
 
     ctypedef enum uv_membership:
         UV_LEAVE_GROUP = 0,
         UV_JOIN_GROUP
+
+    cpdef enum uv_fs_event:
+        UV_RENAME = 1,
+        UV_CHANGE = 2
 
     const char* uv_strerror(int err)
     const char* uv_err_name(int err)
@@ -226,14 +262,22 @@ cdef extern from "uv.h" nogil:
 
     ctypedef void (*uv_connect_cb)(uv_connect_t* req, int status) with gil
 
-    # Buffers
-
-    uv_buf_t uv_buf_init(char* base, unsigned int len)
+    ctypedef void (*uv_udp_send_cb)(uv_udp_send_t* req, int status) with gil
+    ctypedef void (*uv_udp_recv_cb)(uv_udp_t* handle,
+                                    ssize_t nread,
+                                    const uv_buf_t* buf,
+                                    const system.sockaddr* addr,
+                                    unsigned flags) with gil
+    ctypedef void (*uv_fs_event_cb)(uv_fs_event_t* handle,
+                                    const char *filename,
+                                    int events,
+                                    int status) with gil
 
     # Generic request functions
     int uv_cancel(uv_req_t* req)
 
     # Generic handler functions
+    int uv_is_active(const uv_handle_t* handle)
     void uv_close(uv_handle_t* handle, uv_close_cb close_cb)
     int uv_is_closing(const uv_handle_t* handle)
     int uv_fileno(const uv_handle_t* handle, uv_os_fd_t* fd)
@@ -271,9 +315,9 @@ cdef extern from "uv.h" nogil:
 
     # Async handler
     int uv_async_init(uv_loop_t*,
-                      uv_async_t* async,
+                      uv_async_t* async_,
                       uv_async_cb async_cb)
-    int uv_async_send(uv_async_t* async)
+    int uv_async_send(uv_async_t* async_)
 
     # Timer handler
     int uv_timer_init(uv_loop_t*, uv_timer_t* handle)
@@ -326,7 +370,8 @@ cdef extern from "uv.h" nogil:
     int uv_tcp_nodelay(uv_tcp_t* handle, int enable)
     int uv_tcp_keepalive(uv_tcp_t* handle, int enable, unsigned int delay)
     int uv_tcp_open(uv_tcp_t* handle, uv_os_sock_t sock)
-    int uv_tcp_bind(uv_tcp_t* handle, system.sockaddr* addr, unsigned int flags)
+    int uv_tcp_bind(uv_tcp_t* handle, system.sockaddr* addr,
+                    unsigned int flags)
 
     int uv_tcp_getsockname(const uv_tcp_t* handle, system.sockaddr* name,
                            int* namelen)
@@ -345,12 +390,37 @@ cdef extern from "uv.h" nogil:
     void uv_pipe_connect(uv_connect_t* req, uv_pipe_t* handle,
                          const char* name, uv_connect_cb cb)
 
+    # UDP
+
+    int uv_udp_init_ex(uv_loop_t* loop, uv_udp_t* handle, unsigned int flags)
+    int uv_udp_connect(uv_udp_t* handle, const system.sockaddr* addr)
+    int uv_udp_open(uv_udp_t* handle, uv_os_sock_t sock)
+    int uv_udp_bind(uv_udp_t* handle, const system.sockaddr* addr,
+                    unsigned int flags)
+    int uv_udp_send(uv_udp_send_t* req, uv_udp_t* handle,
+                    const uv_buf_t bufs[], unsigned int nbufs,
+                    const system.sockaddr* addr, uv_udp_send_cb send_cb)
+    int uv_udp_try_send(uv_udp_t* handle,
+                        const uv_buf_t bufs[], unsigned int nbufs,
+                        const system.sockaddr* addr)
+    int uv_udp_recv_start(uv_udp_t* handle, uv_alloc_cb alloc_cb,
+                          uv_udp_recv_cb recv_cb)
+    int uv_udp_recv_stop(uv_udp_t* handle)
+    int uv_udp_set_broadcast(uv_udp_t* handle, int on)
+
     # Polling
 
     int uv_poll_init_socket(uv_loop_t* loop, uv_poll_t* handle,
                             uv_os_sock_t socket)
     int uv_poll_start(uv_poll_t* handle, int events, uv_poll_cb cb)
     int uv_poll_stop(uv_poll_t* poll)
+
+    # FS Event
+
+    int uv_fs_event_init(uv_loop_t *loop, uv_fs_event_t *handle)
+    int uv_fs_event_start(uv_fs_event_t *handle, uv_fs_event_cb cb,
+                          const char *path, unsigned int flags)
+    int uv_fs_event_stop(uv_fs_event_t *handle)
 
     # Misc
 
@@ -437,3 +507,5 @@ cdef extern from "uv.h" nogil:
                  const uv_process_options_t* options)
 
     int uv_process_kill(uv_process_t* handle, int signum)
+
+    unsigned int uv_version()

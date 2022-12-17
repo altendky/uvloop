@@ -1,4 +1,3 @@
-@cython.no_gc_clear
 cdef class UVHandle:
     """A base class for all libuv handles.
 
@@ -26,13 +25,11 @@ cdef class UVHandle:
                 self.__class__.__name__))
 
     def __dealloc__(self):
-        self._dealloc_impl()
-
-    cdef _dealloc_impl(self):
         if UVLOOP_DEBUG:
             if self._loop is not None:
-                self._loop._debug_handles_current.subtract([
-                    self.__class__.__name__])
+                if self._inited:
+                    self._loop._debug_handles_current.subtract([
+                        self.__class__.__name__])
             else:
                 # No "@cython.no_gc_clear" decorator on this UVHandle
                 raise RuntimeError(
@@ -40,9 +37,6 @@ cdef class UVHandle:
                     .format(self.__class__.__name__))
 
         if self._handle is NULL:
-            if UVLOOP_DEBUG:
-                if self._has_handle == 0:
-                    self._loop._debug_uv_handles_freed += 1
             return
 
         # -> When we're at this point, something is wrong <-
@@ -55,7 +49,7 @@ cdef class UVHandle:
                 '{} is open in __dealloc__ with loop set to NULL'
                 .format(self.__class__.__name__))
 
-        if self._closed == 1:
+        if self._closed:
             # So _handle is not NULL and self._closed == 1?
             raise RuntimeError(
                 '{}.__dealloc__: _handle is NULL, _closed == 1'.format(
@@ -66,7 +60,7 @@ cdef class UVHandle:
         # errors during Handle.__cinit__/__init__ etc.
         if self._inited:
             self._handle.data = NULL
-            uv.uv_close(self._handle, __uv_close_handle_cb) # void; no errors
+            uv.uv_close(self._handle, __uv_close_handle_cb)  # void; no errors
             self._handle = NULL
             self._warn_unclosed()
         else:
@@ -78,7 +72,7 @@ cdef class UVHandle:
         if self._handle == NULL:
             return
 
-        if UVLOOP_DEBUG:
+        if UVLOOP_DEBUG and self._inited:
             self._loop._debug_uv_handles_freed += 1
 
         PyMem_RawFree(self._handle)
@@ -105,16 +99,17 @@ cdef class UVHandle:
         if self._handle is not NULL:
             self._free()
 
-        self._closed = 1
-
-        if UVLOOP_DEBUG:
-            name = self.__class__.__name__
-            if self._inited:
-                raise RuntimeError(
-                    '_abort_init: {}._inited is set'.format(name))
-            if self._closed:
-                raise RuntimeError(
-                    '_abort_init: {}._closed is set'.format(name))
+        try:
+            if UVLOOP_DEBUG:
+                name = self.__class__.__name__
+                if self._inited:
+                    raise RuntimeError(
+                        '_abort_init: {}._inited is set'.format(name))
+                if self._closed:
+                    raise RuntimeError(
+                        '_abort_init: {}._closed is set'.format(name))
+        finally:
+            self._closed = 1
 
     cdef inline _finish_init(self):
         self._inited = 1
@@ -123,7 +118,10 @@ cdef class UVHandle:
         if self._loop._debug:
             self._source_traceback = extract_stack()
         if UVLOOP_DEBUG:
+            cls_name = self.__class__.__name__
             self._loop._debug_uv_handles_total += 1
+            self._loop._debug_handles_total.update([cls_name])
+            self._loop._debug_handles_current.update([cls_name])
 
     cdef inline _start_init(self, Loop loop):
         if UVLOOP_DEBUG:
@@ -131,10 +129,6 @@ cdef class UVHandle:
                 raise RuntimeError(
                     '{}._start_init can only be called once'.format(
                         self.__class__.__name__))
-
-            cls_name = self.__class__.__name__
-            loop._debug_handles_total.update([cls_name])
-            loop._debug_handles_current.update([cls_name])
 
         self._loop = loop
 
@@ -215,7 +209,7 @@ cdef class UVHandle:
         # We want the handle wrapper (UVHandle) to stay alive until
         # the closing callback fires.
         Py_INCREF(self)
-        uv.uv_close(self._handle, __uv_close_handle_cb) # void; no errors
+        uv.uv_close(self._handle, __uv_close_handle_cb)  # void; no errors
 
     def __repr__(self):
         return '<{} closed={} {:#x}>'.format(
@@ -224,7 +218,6 @@ cdef class UVHandle:
             id(self))
 
 
-@cython.no_gc_clear
 cdef class UVSocketHandle(UVHandle):
 
     def __cinit__(self):
@@ -298,8 +291,8 @@ cdef class UVSocketHandle(UVHandle):
             self._loop.call_exception_handler({
                 'exception': ex,
                 'transport': self,
-                'message': 'could not close attached file object {!r}'.
-                    format(self._fileobj)
+                'message': f'could not close attached file object '
+                           f'{self._fileobj!r}',
             })
         finally:
             self._fileobj = None
@@ -367,13 +360,18 @@ cdef void __uv_close_handle_cb(uv.uv_handle_t* handle) with gil:
                     h.__class__.__name__])
             h._free()
         finally:
-            Py_DECREF(h) # Was INCREFed in UVHandle._close
+            Py_DECREF(h)  # Was INCREFed in UVHandle._close
 
 
 cdef void __close_all_handles(Loop loop):
-    uv.uv_walk(loop.uvloop, __uv_walk_close_all_handles_cb, <void*>loop) # void
+    uv.uv_walk(loop.uvloop,
+               __uv_walk_close_all_handles_cb,
+               <void*>loop)  # void
 
-cdef void __uv_walk_close_all_handles_cb(uv.uv_handle_t* handle, void* arg) with gil:
+
+cdef void __uv_walk_close_all_handles_cb(
+        uv.uv_handle_t* handle, void* arg) with gil:
+
     cdef:
         Loop loop = <Loop>arg
         UVHandle h

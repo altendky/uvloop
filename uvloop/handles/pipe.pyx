@@ -1,8 +1,7 @@
 cdef __pipe_init_uv_handle(UVStream handle, Loop loop):
     cdef int err
 
-    handle._handle = <uv.uv_handle_t*> \
-                        PyMem_RawMalloc(sizeof(uv.uv_pipe_t))
+    handle._handle = <uv.uv_handle_t*>PyMem_RawMalloc(sizeof(uv.uv_pipe_t))
     if handle._handle is NULL:
         handle._abort_init()
         raise MemoryError()
@@ -13,6 +12,9 @@ cdef __pipe_init_uv_handle(UVStream handle, Loop loop):
     err = uv.uv_pipe_init(handle._loop.uvloop,
                           <uv.uv_pipe_t*>handle._handle,
                           0)
+    # UV_HANDLE_READABLE allows calling uv_read_start() on this pipe
+    # even if it is O_WRONLY, see also #317, libuv/libuv#2058
+    handle._handle.flags |= uv.UV_INTERNAL_HANDLE_READABLE
     if err < 0:
         handle._abort_init()
         raise convert_error(err)
@@ -39,11 +41,15 @@ cdef class UnixServer(UVStreamServer):
 
     @staticmethod
     cdef UnixServer new(Loop loop, object protocol_factory, Server server,
-                          object ssl):
+                        object backlog,
+                        object ssl,
+                        object ssl_handshake_timeout,
+                        object ssl_shutdown_timeout):
 
         cdef UnixServer handle
         handle = UnixServer.__new__(UnixServer)
-        handle._init(loop, protocol_factory, server, ssl)
+        handle._init(loop, protocol_factory, server, backlog,
+                     ssl, ssl_handshake_timeout, ssl_shutdown_timeout)
         __pipe_init_uv_handle(<UVStream>handle, loop)
         return handle
 
@@ -67,9 +73,11 @@ cdef class UnixServer(UVStreamServer):
 
         self._mark_as_open()
 
-    cdef UVStream _make_new_transport(self, object protocol, object waiter):
+    cdef UVStream _make_new_transport(self, object protocol, object waiter,
+                                      object context):
         cdef UnixTransport tr
-        tr = UnixTransport.new(self._loop, protocol, self._server, waiter)
+        tr = UnixTransport.new(self._loop, protocol, self._server, waiter,
+                               context)
         return <UVStream>tr
 
 
@@ -78,11 +86,11 @@ cdef class UnixTransport(UVStream):
 
     @staticmethod
     cdef UnixTransport new(Loop loop, object protocol, Server server,
-                             object waiter):
+                           object waiter, object context):
 
         cdef UnixTransport handle
         handle = UnixTransport.__new__(UnixTransport)
-        handle._init(loop, protocol, server, waiter)
+        handle._init(loop, protocol, server, waiter, context)
         __pipe_init_uv_handle(<UVStream>handle, loop)
         return handle
 
@@ -103,10 +111,12 @@ cdef class ReadUnixTransport(UVStream):
 
     @staticmethod
     cdef ReadUnixTransport new(Loop loop, object protocol, Server server,
-                                 object waiter):
+                               object waiter):
         cdef ReadUnixTransport handle
         handle = ReadUnixTransport.__new__(ReadUnixTransport)
-        handle._init(loop, protocol, server, waiter)
+        # This is only used in connect_read_pipe() and subprocess_shell/exec()
+        # directly, we could simply copy the current context.
+        handle._init(loop, protocol, server, waiter, Context_CopyCurrent())
         __pipe_init_uv_handle(<UVStream>handle, loop)
         return handle
 
@@ -146,7 +156,7 @@ cdef class WriteUnixTransport(UVStream):
 
     @staticmethod
     cdef WriteUnixTransport new(Loop loop, object protocol, Server server,
-                                  object waiter):
+                                object waiter):
         cdef WriteUnixTransport handle
         handle = WriteUnixTransport.__new__(WriteUnixTransport)
 
@@ -156,7 +166,9 @@ cdef class WriteUnixTransport(UVStream):
         # close the transport.
         handle._close_on_read_error()
 
-        handle._init(loop, protocol, server, waiter)
+        # This is only used in connect_write_pipe() and subprocess_shell/exec()
+        # directly, we could simply copy the current context.
+        handle._init(loop, protocol, server, waiter, Context_CopyCurrent())
         __pipe_init_uv_handle(<UVStream>handle, loop)
         return handle
 
@@ -176,12 +188,10 @@ cdef class WriteUnixTransport(UVStream):
 cdef class _PipeConnectRequest(UVRequest):
     cdef:
         UnixTransport transport
+        uv.uv_connect_t _req_data
 
     def __cinit__(self, loop, transport):
-        self.request = <uv.uv_req_t*> PyMem_RawMalloc(sizeof(uv.uv_connect_t))
-        if self.request is NULL:
-            self.on_done()
-            raise MemoryError()
+        self.request = <uv.uv_req_t*> &self._req_data
         self.request.data = <void*>self
         self.transport = transport
 
@@ -208,7 +218,6 @@ cdef void __pipe_connect_callback(uv.uv_connect_t* req, int status) with gil:
     try:
         transport._on_connect(exc)
     except BaseException as ex:
-        wrapper.transport._error(ex, False)
+        wrapper.transport._fatal_error(ex, False)
     finally:
         wrapper.on_done()
-

@@ -1,36 +1,74 @@
+import sys
+
+vi = sys.version_info
+if vi < (3, 7):
+    raise RuntimeError('uvloop requires Python 3.7 or greater')
+
+if sys.platform in ('win32', 'cygwin', 'cli'):
+    raise RuntimeError('uvloop does not support Windows at the moment')
+
 import os
 import os.path
+import pathlib
 import platform
 import re
 import shutil
 import subprocess
 import sys
 
-
-vi = sys.version_info
-if vi < (3, 5):
-    raise RuntimeError('uvloop requires Python 3.5 or greater')
-if vi[:2] == (3, 6):
-    if vi.releaselevel == 'beta' and vi.serial < 3:
-        raise RuntimeError('uvloop requires Python 3.5 or 3.6b3 or greater')
-
-
 from setuptools import setup, Extension
-from setuptools.command.build_ext import build_ext as build_ext
-from setuptools.command.sdist import sdist as sdist
+from setuptools.command.build_ext import build_ext
+from setuptools.command.sdist import sdist
 
 
-VERSION = '0.8.1'
-CFLAGS = ['-O2']
-LIBUV_DIR = os.path.join(os.path.dirname(__file__), 'vendor', 'libuv')
-LIBUV_BUILD_DIR = os.path.join(os.path.dirname(__file__), 'build', 'libuv')
+CYTHON_DEPENDENCY = 'Cython(>=0.29.32,<0.30.0)'
+
+# Minimal dependencies required to test uvloop.
+TEST_DEPENDENCIES = [
+    # pycodestyle is a dependency of flake8, but it must be frozen because
+    # their combination breaks too often
+    # (example breakage: https://gitlab.com/pycqa/flake8/issues/427)
+    # aiohttp doesn't support 3.11 yet,
+    # see https://github.com/aio-libs/aiohttp/issues/6600
+    'aiohttp ; python_version < "3.11"',
+    'flake8~=3.9.2',
+    'psutil',
+    'pycodestyle~=2.7.0',
+    'pyOpenSSL~=22.0.0',
+    'mypy>=0.800',
+    CYTHON_DEPENDENCY,
+]
+
+# Dependencies required to build documentation.
+DOC_DEPENDENCIES = [
+    'Sphinx~=4.1.2',
+    'sphinxcontrib-asyncio~=0.3.0',
+    'sphinx_rtd_theme~=0.5.2',
+]
+
+EXTRA_DEPENDENCIES = {
+    'docs': DOC_DEPENDENCIES,
+    'test': TEST_DEPENDENCIES,
+    # Dependencies required to develop uvloop.
+    'dev': [
+        CYTHON_DEPENDENCY,
+        'pytest>=3.6.0',
+    ] + DOC_DEPENDENCIES + TEST_DEPENDENCIES
+}
+
+
+MACHINE = platform.machine()
+MODULES_CFLAGS = [os.getenv('UVLOOP_OPT_CFLAGS', '-O2')]
+_ROOT = pathlib.Path(__file__).parent
+LIBUV_DIR = str(_ROOT / 'vendor' / 'libuv')
+LIBUV_BUILD_DIR = str(_ROOT / 'build' / 'libuv-{}'.format(MACHINE))
 
 
 def _libuv_build_env():
     env = os.environ.copy()
 
     cur_cflags = env.get('CFLAGS', '')
-    if not re.search('-O\d', cur_cflags):
+    if not re.search(r'-O\d', cur_cflags):
         cur_cflags += ' -O2'
 
     env['CFLAGS'] = (cur_cflags + ' -fPIC ' + env.get('ARCHFLAGS', ''))
@@ -39,9 +77,17 @@ def _libuv_build_env():
 
 
 def _libuv_autogen(env):
-    if not os.path.exists(os.path.join(LIBUV_DIR, 'configure')):
-        subprocess.run(
-            ['/bin/sh', 'autogen.sh'], cwd=LIBUV_DIR, env=env, check=True)
+    if os.path.exists(os.path.join(LIBUV_DIR, 'configure')):
+        # No need to use autogen, the configure script is there.
+        return
+
+    if not os.path.exists(os.path.join(LIBUV_DIR, 'autogen.sh')):
+        raise RuntimeError(
+            'the libuv submodule has not been checked out; '
+            'try running "git submodule init; git submodule update"')
+
+    subprocess.run(
+        ['/bin/sh', 'autogen.sh'], cwd=LIBUV_DIR, env=env, check=True)
 
 
 class uvloop_sdist(sdist):
@@ -71,12 +117,6 @@ class uvloop_build_ext(build_ext):
     ]
 
     def initialize_options(self):
-        # initialize_options() may be called multiple times on the
-        # same command object, so make sure not to override previously
-        # set options.
-        if getattr(self, '_initialized', False):
-            return
-
         super().initialize_options()
         self.use_system_libuv = False
         self.cython_always = False
@@ -84,12 +124,6 @@ class uvloop_build_ext(build_ext):
         self.cython_directives = None
 
     def finalize_options(self):
-        # finalize_options() may be called multiple times on the
-        # same command object, so make sure not to override previously
-        # set options.
-        if getattr(self, '_initialized', False):
-            return
-
         need_cythonize = self.cython_always
         cfiles = {}
 
@@ -109,15 +143,25 @@ class uvloop_build_ext(build_ext):
                         need_cythonize = True
 
         if need_cythonize:
+            import pkg_resources
+
+            # Double check Cython presence in case setup_requires
+            # didn't go into effect (most likely because someone
+            # imported Cython before setup_requires injected the
+            # correct egg into sys.path.
             try:
                 import Cython
             except ImportError:
                 raise RuntimeError(
-                    'please install Cython to compile uvloop from source')
+                    'please install {} to compile uvloop from source'.format(
+                        CYTHON_DEPENDENCY))
 
-            if Cython.__version__ < '0.24':
+            cython_dep = pkg_resources.Requirement.parse(CYTHON_DEPENDENCY)
+            if Cython.__version__ not in cython_dep:
                 raise RuntimeError(
-                    'uvloop requires Cython version 0.24 or greater')
+                    'uvloop requires {}, got Cython=={}'.format(
+                        CYTHON_DEPENDENCY, Cython.__version__
+                    ))
 
             from Cython.Build import cythonize
 
@@ -137,79 +181,7 @@ class uvloop_build_ext(build_ext):
                 compiler_directives=directives,
                 annotate=self.cython_annotate)
 
-            for cfile, timestamp in cfiles.items():
-                if os.path.getmtime(cfile) != timestamp:
-                    # The file was recompiled, patch
-                    self._patch_cfile(cfile)
-
         super().finalize_options()
-
-        self._initialized = True
-
-    def _patch_cfile(self, cfile):
-        # Patch Cython 'async def' coroutines to have a 'tp_iter'
-        # slot, which makes them compatible with 'yield from' without
-        # the `asyncio.coroutine` decorator.
-
-        with open(cfile, 'rt') as f:
-            src = f.read()
-
-        src = re.sub(
-            r'''
-            \s* offsetof\(__pyx_CoroutineObject,\s*gi_weakreflist\),
-            \s* 0,
-            \s* 0,
-            \s* __pyx_Coroutine_methods,
-            \s* __pyx_Coroutine_memberlist,
-            \s* __pyx_Coroutine_getsets,
-            ''',
-
-            r'''
-            offsetof(__pyx_CoroutineObject, gi_weakreflist),
-            __Pyx_Coroutine_await, /* tp_iter */
-            (iternextfunc) __Pyx_Generator_Next, /* tp_iternext */
-            __pyx_Coroutine_methods,
-            __pyx_Coroutine_memberlist,
-            __pyx_Coroutine_getsets,
-            ''',
-
-            src, flags=re.X)
-
-        # Fix a segfault in Cython.
-        src = re.sub(
-            r'''
-            \s* __Pyx_Coroutine_get_qualname\(__pyx_CoroutineObject\s+\*self\)
-            \s* {
-            \s* Py_INCREF\(self->gi_qualname\);
-            ''',
-
-            r'''
-            __Pyx_Coroutine_get_qualname(__pyx_CoroutineObject *self)
-            {
-                if (self->gi_qualname == NULL) { return __pyx_empty_unicode; }
-                Py_INCREF(self->gi_qualname);
-            ''',
-
-            src, flags=re.X)
-
-        src = re.sub(
-            r'''
-            \s* __Pyx_Coroutine_get_name\(__pyx_CoroutineObject\s+\*self\)
-            \s* {
-            \s* Py_INCREF\(self->gi_name\);
-            ''',
-
-            r'''
-            __Pyx_Coroutine_get_name(__pyx_CoroutineObject *self)
-            {
-                if (self->gi_name == NULL) { return __pyx_empty_unicode; }
-                Py_INCREF(self->gi_name);
-            ''',
-
-            src, flags=re.X)
-
-        with open(cfile, 'wt') as f:
-            f.write(src)
 
     def build_libuv(self):
         env = _libuv_build_env()
@@ -328,8 +300,26 @@ class uvloop_build_ext(build_ext):
         super().build_extensions()
 
 
-with open(os.path.join(os.path.dirname(__file__), 'README.rst')) as f:
+with open(str(_ROOT / 'README.rst')) as f:
     readme = f.read()
+
+
+with open(str(_ROOT / 'uvloop' / '_version.py')) as f:
+    for line in f:
+        if line.startswith('__version__ ='):
+            _, _, version = line.partition('=')
+            VERSION = version.strip(" \n'\"")
+            break
+    else:
+        raise RuntimeError(
+            'unable to read the version from uvloop/_version.py')
+
+
+setup_requires = []
+
+if not (_ROOT / 'uvloop' / 'loop.c').exists() or '--cython-always' in sys.argv:
+    # No Cython output, require Cython to build.
+    setup_requires.append(CYTHON_DEPENDENCY)
 
 
 setup(
@@ -340,7 +330,7 @@ setup(
     license='MIT',
     author='Yury Selivanov',
     author_email='yury@magic.io',
-    platforms=['*nix'],
+    platforms=['macOS', 'POSIX'],
     version=VERSION,
     packages=['uvloop'],
     cmdclass={
@@ -353,19 +343,23 @@ setup(
             sources=[
                 "uvloop/loop.pyx",
             ],
-            extra_compile_args=CFLAGS
+            extra_compile_args=MODULES_CFLAGS
         ),
     ],
     classifiers=[
         'Development Status :: 5 - Production/Stable',
+        'Framework :: AsyncIO',
         'Programming Language :: Python :: 3 :: Only',
-        'Programming Language :: Python :: 3.5',
-        'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
         'License :: OSI Approved :: Apache Software License',
         'License :: OSI Approved :: MIT License',
         'Intended Audience :: Developers',
     ],
-    provides=['uvloop'],
     include_package_data=True,
-    test_suite='tests.suite'
+    extras_require=EXTRA_DEPENDENCIES,
+    setup_requires=setup_requires,
+    python_requires='>=3.7',
 )

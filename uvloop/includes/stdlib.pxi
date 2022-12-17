@@ -1,7 +1,10 @@
+# flake8: noqa
+
+
 import asyncio, asyncio.log, asyncio.base_events, \
        asyncio.sslproto, asyncio.coroutines, \
-       asyncio.futures
-import collections
+       asyncio.futures, asyncio.transports
+import collections.abc
 import concurrent.futures
 import errno
 import functools
@@ -9,7 +12,7 @@ import gc
 import inspect
 import itertools
 import os
-import signal as std_signal
+import signal
 import socket
 import subprocess
 import ssl
@@ -37,14 +40,16 @@ cdef aio_iscoroutine = asyncio.iscoroutine
 cdef aio_iscoroutinefunction = asyncio.iscoroutinefunction
 cdef aio_BaseProtocol = asyncio.BaseProtocol
 cdef aio_Protocol = asyncio.Protocol
-cdef aio_SSLProtocol = asyncio.sslproto.SSLProtocol
-cdef aio_debug_wrapper = asyncio.coroutines.debug_wrapper
 cdef aio_isfuture = getattr(asyncio, 'isfuture', None)
 cdef aio_get_running_loop = getattr(asyncio, '_get_running_loop', None)
 cdef aio_set_running_loop = getattr(asyncio, '_set_running_loop', None)
+cdef aio_debug_wrapper = getattr(asyncio.coroutines, 'debug_wrapper', None)
+cdef aio_AbstractChildWatcher = asyncio.AbstractChildWatcher
+cdef aio_Transport = asyncio.Transport
+cdef aio_FlowControlMixin = asyncio.transports._FlowControlMixin
 
 cdef col_deque = collections.deque
-cdef col_Iterable = collections.Iterable
+cdef col_Iterable = collections.abc.Iterable
 cdef col_Counter = collections.Counter
 cdef col_OrderedDict = collections.OrderedDict
 
@@ -61,10 +66,13 @@ cdef gc_disable = gc.disable
 cdef iter_chain = itertools.chain
 cdef inspect_isgenerator = inspect.isgenerator
 
+cdef int has_IPV6_V6ONLY = hasattr(socket, 'IPV6_V6ONLY')
+cdef int IPV6_V6ONLY = getattr(socket, 'IPV6_V6ONLY', -1)
 cdef int has_SO_REUSEPORT = hasattr(socket, 'SO_REUSEPORT')
 cdef int SO_REUSEPORT = getattr(socket, 'SO_REUSEPORT', 0)
 cdef int SO_BROADCAST = getattr(socket, 'SO_BROADCAST')
 cdef int SOCK_NONBLOCK = getattr(socket, 'SOCK_NONBLOCK', -1)
+cdef int socket_AI_CANONNAME = getattr(socket, 'AI_CANONNAME')
 
 cdef socket_gaierror = socket.gaierror
 cdef socket_error = socket.error
@@ -104,30 +112,45 @@ cdef os_pipe = os.pipe
 cdef os_read = os.read
 cdef os_remove = os.remove
 cdef os_stat = os.stat
+cdef os_fspath = os.fspath
 
 cdef stat_S_ISSOCK = stat.S_ISSOCK
 
 cdef sys_ignore_environment = sys.flags.ignore_environment
+cdef sys_dev_mode = sys.flags.dev_mode
 cdef sys_exc_info = sys.exc_info
-cdef sys_set_coroutine_wrapper = sys.set_coroutine_wrapper
-cdef sys_get_coroutine_wrapper = sys.get_coroutine_wrapper
+cdef sys_set_coroutine_wrapper = getattr(sys, 'set_coroutine_wrapper', None)
+cdef sys_get_coroutine_wrapper = getattr(sys, 'get_coroutine_wrapper', None)
 cdef sys_getframe = sys._getframe
 cdef sys_version_info = sys.version_info
+cdef sys_getfilesystemencoding = sys.getfilesystemencoding
+cdef str sys_platform = sys.platform
 
 cdef ssl_SSLContext = ssl.SSLContext
+cdef ssl_MemoryBIO = ssl.MemoryBIO
+cdef ssl_create_default_context = ssl.create_default_context
+cdef ssl_SSLError = ssl.SSLError
+cdef ssl_SSLAgainErrors = (ssl.SSLWantReadError, ssl.SSLSyscallError)
+cdef ssl_SSLZeroReturnError = ssl.SSLZeroReturnError
+cdef ssl_CertificateError = ssl.CertificateError
+cdef int ssl_SSL_ERROR_WANT_READ = ssl.SSL_ERROR_WANT_READ
+cdef int ssl_SSL_ERROR_WANT_WRITE = ssl.SSL_ERROR_WANT_WRITE
+cdef int ssl_SSL_ERROR_SYSCALL = ssl.SSL_ERROR_SYSCALL
 
-cdef long MAIN_THREAD_ID = <long>threading.main_thread().ident
+cdef threading_Thread = threading.Thread
+cdef threading_main_thread = threading.main_thread
 
 cdef int subprocess_PIPE = subprocess.PIPE
 cdef int subprocess_STDOUT = subprocess.STDOUT
 cdef int subprocess_DEVNULL = subprocess.DEVNULL
 cdef subprocess_SubprocessError = subprocess.SubprocessError
 
-cdef int signal_NSIG = std_signal.NSIG
-cdef signal_signal = std_signal.signal
-cdef signal_set_wakeup_fd = std_signal.set_wakeup_fd
-cdef signal_default_int_handler = std_signal.default_int_handler
-cdef signal_SIG_DFL = std_signal.SIG_DFL
+cdef int signal_NSIG = signal.NSIG
+cdef signal_signal = signal.signal
+cdef signal_siginterrupt = signal.siginterrupt
+cdef signal_set_wakeup_fd = signal.set_wakeup_fd
+cdef signal_default_int_handler = signal.default_int_handler
+cdef signal_SIG_DFL = signal.SIG_DFL
 
 cdef time_sleep = time.sleep
 cdef time_monotonic = time.monotonic
@@ -148,5 +171,5 @@ cdef py_inf = float('inf')
 # so we delete refs to all modules manually (except sys and errno)
 del asyncio, concurrent, collections
 del functools, inspect, itertools, socket, os, threading
-del std_signal, subprocess, ssl
+del signal, subprocess, ssl
 del time, traceback, warnings, weakref

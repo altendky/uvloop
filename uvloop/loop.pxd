@@ -11,7 +11,7 @@ include "includes/consts.pxi"
 
 
 cdef extern from *:
-     ctypedef int vint "volatile int"
+    ctypedef int vint "volatile int"
 
 
 cdef class UVHandle
@@ -33,7 +33,8 @@ cdef class Loop:
     cdef:
         uv.uv_loop_t *uvloop
 
-        bint _coroutine_wrapper_set
+        bint _coroutine_debug_set
+        int _coroutine_origin_tracking_saved_depth
 
         public slow_callback_duration
 
@@ -42,25 +43,28 @@ cdef class Loop:
         bint _running
         bint _stopping
 
-        long _thread_id
-        bint _thread_is_main
+        uint64_t _thread_id
 
         object _task_factory
         object _exception_handler
         object _default_executor
         object _ready
-        set _queued_streams
+        set _queued_streams, _executing_streams
         Py_ssize_t _ready_len
 
         set _servers
 
         object _transports
+        set _processes
         dict _fd_to_reader_fileobj
         dict _fd_to_writer_fileobj
 
+        set _signals
         dict _signal_handlers
         object _ssock
         object _csock
+        bint _listening_signals
+        int _old_signal_wakeup_id
 
         set _timers
         dict _polls
@@ -78,12 +82,15 @@ cdef class Loop:
         object _asyncgens
         bint _asyncgens_shutdown_called
 
+        bint _executor_shutdown_called
+
         char _recv_buffer[UV_STREAM_RECV_BUF_SIZE]
         bint _recv_buffer_in_use
 
         # DEBUG fields
-        readonly bint _debug_cc  # True when compiled with DEBUG.
-                                 # Only for unittests.
+        # True when compiled with DEBUG.
+        # Used only in unittests.
+        readonly bint _debug_cc
 
         readonly object _debug_handles_total
         readonly object _debug_handles_closed
@@ -136,12 +143,16 @@ cdef class Loop:
     cdef inline _queue_write(self, UVStream stream)
     cdef _exec_queued_writes(self)
 
-    cdef inline _call_soon(self, object callback, object args)
+    cdef inline _call_soon(self, object callback, object args, object context)
+    cdef inline _append_ready_handle(self, Handle handle)
     cdef inline _call_soon_handle(self, Handle handle)
 
-    cdef _call_later(self, uint64_t delay, object callback, object args)
+    cdef _call_later(self, uint64_t delay, object callback, object args,
+                     object context)
 
     cdef void _handle_exception(self, object ex)
+
+    cdef inline _is_main_thread(self)
 
     cdef inline _new_future(self)
     cdef inline _check_signal(self, sig)
@@ -155,21 +166,19 @@ cdef class Loop:
 
     cdef _getnameinfo(self, system.sockaddr *addr, int flags)
 
-    cdef _create_server(self, system.sockaddr *addr,
-                        object protocol_factory,
-                        Server server,
-                        object ssl,
-                        bint reuse_port,
-                        object backlog)
-
     cdef _track_transport(self, UVBaseTransport transport)
     cdef _fileobj_to_fd(self, fileobj)
     cdef _ensure_fd_no_transport(self, fd)
 
+    cdef _track_process(self, UVProcess proc)
+    cdef _untrack_process(self, UVProcess proc)
+
     cdef _add_reader(self, fd, Handle handle)
+    cdef _has_reader(self, fd)
     cdef _remove_reader(self, fd)
 
     cdef _add_writer(self, fd, Handle handle)
+    cdef _has_writer(self, fd)
     cdef _remove_writer(self, fd)
 
     cdef _sock_recv(self, fut, sock, n)
@@ -177,21 +186,23 @@ cdef class Loop:
     cdef _sock_sendall(self, fut, sock, data)
     cdef _sock_accept(self, fut, sock)
 
-    cdef _sock_connect(self, fut, sock, address)
+    cdef _sock_connect(self, sock, address)
     cdef _sock_connect_cb(self, fut, sock, address)
 
     cdef _sock_set_reuseport(self, int fd)
 
-    cdef _setup_signals(self)
+    cdef _setup_or_resume_signals(self)
     cdef _shutdown_signals(self)
-    cdef _recv_signals_start(self)
-    cdef _recv_signals_stop(self)
+    cdef _pause_signals(self)
 
     cdef _handle_signal(self, sig)
     cdef _read_from_self(self)
-    cdef _process_self_data(self, data)
+    cdef inline _ceval_process_signals(self)
+    cdef _invoke_signals(self, bytes data)
 
-    cdef _set_coroutine_wrapper(self, bint enabled)
+    cdef _set_coroutine_debug(self, bint enabled)
+
+    cdef _print_debug_info(self)
 
 
 include "cbhandles.pxd"
@@ -208,8 +219,10 @@ include "handles/streamserver.pxd"
 include "handles/tcp.pxd"
 include "handles/pipe.pxd"
 include "handles/process.pxd"
+include "handles/fsevent.pxd"
 
 include "request.pxd"
+include "sslproto.pxd"
 
 include "handles/udp.pxd"
 

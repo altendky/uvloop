@@ -6,14 +6,23 @@ cimport cython
 from .includes.debug cimport UVLOOP_DEBUG
 from .includes cimport uv
 from .includes cimport system
-from .includes.python cimport PyMem_RawMalloc, PyMem_RawFree, \
-                              PyMem_RawCalloc, PyMem_RawRealloc, \
-                              PyUnicode_EncodeFSDefault, \
-                              PyErr_SetInterrupt, \
-                              PyOS_AfterFork, \
-                              _PyImport_AcquireLock, \
-                              _PyImport_ReleaseLock, \
-                              _Py_RestoreSignals
+from .includes.python cimport (
+    PY_VERSION_HEX,
+    PyMem_RawMalloc, PyMem_RawFree,
+    PyMem_RawCalloc, PyMem_RawRealloc,
+    PyUnicode_EncodeFSDefault,
+    PyErr_SetInterrupt,
+    _Py_RestoreSignals,
+    Context_CopyCurrent,
+    Context_Enter,
+    Context_Exit,
+    PyMemoryView_FromMemory, PyBUF_WRITE,
+    PyMemoryView_FromObject, PyMemoryView_Check,
+    PyOS_AfterFork_Parent, PyOS_AfterFork_Child,
+    PyOS_BeforeFork,
+    PyUnicode_FromString
+)
+from .includes.flowcontrol cimport add_flowcontrol_defaults
 
 from libc.stdint cimport uint64_t
 from libc.string cimport memset, strerror, memcpy
@@ -23,11 +32,13 @@ from cpython cimport PyObject
 from cpython cimport PyErr_CheckSignals, PyErr_Occurred
 from cpython cimport PyThread_get_thread_ident
 from cpython cimport Py_INCREF, Py_DECREF, Py_XDECREF, Py_XINCREF
-from cpython cimport PyObject_GetBuffer, PyBuffer_Release, PyBUF_SIMPLE, \
-                     Py_buffer, PyBytes_AsString, PyBytes_CheckExact, \
-                     Py_SIZE, PyBytes_AS_STRING
-
-from cpython cimport PyErr_CheckSignals
+from cpython cimport (
+    PyObject_GetBuffer, PyBuffer_Release, PyBUF_SIMPLE,
+    Py_buffer, PyBytes_AsString, PyBytes_CheckExact,
+    PyBytes_AsStringAndSize,
+    Py_SIZE, PyBytes_AS_STRING, PyBUF_WRITABLE
+)
+from cpython.pycapsule cimport PyCapsule_New
 
 from . import _noop
 
@@ -36,6 +47,11 @@ include "includes/consts.pxi"
 include "includes/stdlib.pxi"
 
 include "errors.pyx"
+
+cdef:
+    int PY39 = PY_VERSION_HEX >= 0x03090000
+    int PY311 = PY_VERSION_HEX >= 0x030b0000
+    uint64_t MAX_SLEEP = 3600 * 24 * 365 * 100
 
 
 cdef _is_sock_stream(sock_type):
@@ -86,6 +102,39 @@ cdef inline socket_dec_io_ref(sock):
         sock._decref_socketios()
 
 
+cdef inline run_in_context(context, method):
+    # This method is internally used to workaround a reference issue that in
+    # certain circumstances, inlined context.run() will not hold a reference to
+    # the given method instance, which - if deallocated - will cause segfault.
+    # See also: edgedb/edgedb#2222
+    Py_INCREF(method)
+    try:
+        return context.run(method)
+    finally:
+        Py_DECREF(method)
+
+
+cdef inline run_in_context1(context, method, arg):
+    Py_INCREF(method)
+    try:
+        return context.run(method, arg)
+    finally:
+        Py_DECREF(method)
+
+
+cdef inline run_in_context2(context, method, arg1, arg2):
+    Py_INCREF(method)
+    try:
+        return context.run(method, arg1, arg2)
+    finally:
+        Py_DECREF(method)
+
+
+# Used for deprecation and removal of `loop.create_datagram_endpoint()`'s
+# *reuse_address* parameter
+_unset = object()
+
+
 @cython.no_gc_clear
 cdef class Loop:
     def __cinit__(self):
@@ -97,8 +146,7 @@ cdef class Loop:
         # Install pthread_atfork handlers
         __install_atfork()
 
-        self.uvloop = <uv.uv_loop_t*> \
-                            PyMem_RawMalloc(sizeof(uv.uv_loop_t))
+        self.uvloop = <uv.uv_loop_t*>PyMem_RawMalloc(sizeof(uv.uv_loop_t))
         if self.uvloop is NULL:
             raise MemoryError()
 
@@ -106,12 +154,12 @@ cdef class Loop:
 
         self._closed = 0
         self._debug = 0
-        self._thread_is_main = 0
         self._thread_id = 0
         self._running = 0
         self._stopping = 0
 
         self._transports = weakref_WeakValueDictionary()
+        self._processes = set()
 
         # Used to keep a reference (and hence keep the fileobj alive)
         # for as long as its registered by add_reader or add_writer.
@@ -140,6 +188,7 @@ cdef class Loop:
         self._default_executor = None
 
         self._queued_streams = set()
+        self._executing_streams = set()
         self._ready = col_deque()
         self._ready_len = 0
 
@@ -149,7 +198,7 @@ cdef class Loop:
         self.handler_idle = UVIdle.new(
             self,
             new_MethodHandle(
-                self, "loop._on_idle", <method_t>self._on_idle, self))
+                self, "loop._on_idle", <method_t>self._on_idle, None, self))
 
         # Needed to call `UVStream._exec_write` for writes scheduled
         # during `Protocol.data_received`.
@@ -157,29 +206,38 @@ cdef class Loop:
             self,
             new_MethodHandle(
                 self, "loop._exec_queued_writes",
-                <method_t>self._exec_queued_writes, self))
+                <method_t>self._exec_queued_writes, None, self))
 
+        self._signals = set()
         self._ssock = self._csock = None
-        self._signal_handlers = None
+        self._signal_handlers = {}
+        self._listening_signals = False
+        self._old_signal_wakeup_id = -1
 
-        self._coroutine_wrapper_set = False
+        self._coroutine_debug_set = False
 
-        if hasattr(sys, 'get_asyncgen_hooks'):
-            # Python >= 3.6
-            # A weak set of all asynchronous generators that are
-            # being iterated by the loop.
-            self._asyncgens = weakref_WeakSet()
-        else:
-            self._asyncgens = None
+        # A weak set of all asynchronous generators that are
+        # being iterated by the loop.
+        self._asyncgens = weakref_WeakSet()
 
         # Set to True when `loop.shutdown_asyncgens` is called.
         self._asyncgens_shutdown_called = False
+        # Set to True when `loop.shutdown_default_executor` is called.
+        self._executor_shutdown_called = False
 
         self._servers = set()
 
+    cdef inline _is_main_thread(self):
+        cdef uint64_t main_thread_id = system.MAIN_THREAD_ID
+        if system.MAIN_THREAD_ID_SET == 0:
+            main_thread_id = <uint64_t>threading_main_thread().ident
+            system.setMainThreadID(main_thread_id)
+        return main_thread_id == PyThread_get_thread_ident()
+
     def __init__(self):
-        self.set_debug((not sys_ignore_environment
-                        and bool(os_environ.get('PYTHONASYNCIODEBUG'))))
+        self.set_debug(
+            sys_dev_mode or (not sys_ignore_environment
+                             and bool(os_environ.get('PYTHONASYNCIODEBUG'))))
 
     def __dealloc__(self):
         if self._running == 1:
@@ -235,27 +293,40 @@ cdef class Loop:
 
         self._debug_exception_handler_cnt = 0
 
-    cdef _setup_signals(self):
-        self._ssock, self._csock = socket_socketpair()
-        self._ssock.setblocking(False)
-        self._csock.setblocking(False)
-        try:
-            signal_set_wakeup_fd(self._csock.fileno())
-        except ValueError:
-            # Not the main thread
-            self._ssock.close()
-            self._csock.close()
-            self._ssock = self._csock = None
+    cdef _setup_or_resume_signals(self):
+        if not self._is_main_thread():
             return
 
-        self._signal_handlers = {}
+        if self._listening_signals:
+            raise RuntimeError('signals handling has been already setup')
 
-    cdef _recv_signals_start(self):
-        if self._ssock is None:
-            self._setup_signals()
-            if self._ssock is None:
-                # Not the main thread.
-                return
+        if self._ssock is not None:
+            raise RuntimeError('self-pipe exists before loop run')
+
+        # Create a self-pipe and call set_signal_wakeup_fd() with one
+        # of its ends.  This is needed so that libuv knows that it needs
+        # to wakeup on ^C (no matter if the SIGINT handler is still the
+        # standard Python's one or or user set their own.)
+
+        self._ssock, self._csock = socket_socketpair()
+        try:
+            self._ssock.setblocking(False)
+            self._csock.setblocking(False)
+
+            fileno = self._csock.fileno()
+
+            self._old_signal_wakeup_id = _set_signal_wakeup_fd(fileno)
+        except Exception:
+            # Out of all statements in the try block, only the
+            # "_set_signal_wakeup_fd()" call can fail, but it shouldn't,
+            # as we ensure that the current thread is the main thread.
+            # Still, if something goes horribly wrong we want to clean up
+            # the socket pair.
+            self._ssock.close()
+            self._csock.close()
+            self._ssock = None
+            self._csock = None
+            raise
 
         self._add_reader(
             self._ssock,
@@ -263,41 +334,100 @@ cdef class Loop:
                 self,
                 "Loop._read_from_self",
                 <method_t>self._read_from_self,
+                None,
                 self))
 
-    cdef _recv_signals_stop(self):
-        if self._ssock is None:
-            return
+        self._listening_signals = True
 
-        self._remove_reader(self._ssock)
+    cdef _pause_signals(self):
+        if not self._is_main_thread():
+            if self._listening_signals:
+                raise RuntimeError(
+                    'cannot pause signals handling; no longer running in '
+                    'the main thread')
+            else:
+                return
 
-    cdef _shutdown_signals(self):
-        if self._signal_handlers is None:
-            return
-        for sig in list(self._signal_handlers):
-            self.remove_signal_handler(sig)
-        signal_set_wakeup_fd(-1)
+        if not self._listening_signals:
+            raise RuntimeError('signals handling has not been setup')
+
+        self._listening_signals = False
+
+        _set_signal_wakeup_fd(self._old_signal_wakeup_id)
+
         self._remove_reader(self._ssock)
         self._ssock.close()
         self._csock.close()
+        self._ssock = None
+        self._csock = None
+
+    cdef _shutdown_signals(self):
+        if not self._is_main_thread():
+            if self._signal_handlers:
+                aio_logger.warning(
+                    'cannot cleanup signal handlers: closing the event loop '
+                    'in a non-main OS thread')
+            return
+
+        if self._listening_signals:
+            raise RuntimeError(
+                'cannot shutdown signals handling as it has not been paused')
+
+        if self._ssock:
+            raise RuntimeError(
+                'self-pipe was not cleaned up after loop was run')
+
+        for sig in list(self._signal_handlers):
+            self.remove_signal_handler(sig)
+
+    def __sighandler(self, signum, frame):
+        self._signals.add(signum)
+
+    cdef inline _ceval_process_signals(self):
+        # Invoke CPython eval loop to let process signals.
+        PyErr_CheckSignals()
+        # Calling a pure-Python function will invoke
+        # _PyEval_EvalFrameDefault which will process
+        # pending signal callbacks.
+        _noop.noop()  # Might raise ^C
 
     cdef _read_from_self(self):
+        cdef bytes sigdata
+        sigdata = b''
         while True:
             try:
-                data = self._ssock.recv(4096)
+                data = self._ssock.recv(65536)
                 if not data:
                     break
-                self._process_self_data(data)
+                sigdata += data
             except InterruptedError:
                 continue
             except BlockingIOError:
                 break
+        if sigdata:
+            self._invoke_signals(sigdata)
 
-    cdef _process_self_data(self, data):
+    cdef _invoke_signals(self, bytes data):
+        cdef set sigs
+
+        self._ceval_process_signals()
+
+        sigs = self._signals.copy()
+        self._signals.clear()
         for signum in data:
             if not signum:
-                # ignore null bytes written by _write_to_self()
+                # ignore null bytes written by set_wakeup_fd()
                 continue
+            sigs.discard(signum)
+            self._handle_signal(signum)
+
+        for signum in sigs:
+            # Since not all signals are registered by add_signal_handler()
+            # (for instance, we use the default SIGINT handler) not all
+            # signals will trigger loop.__sighandler() callback.  Therefore
+            # we combine two datasources: one is self-pipe, one is data
+            # from __sighandler; this ensures that signals shouldn't be
+            # lost even if set_wakeup_fd() couldn't write to the self-pipe.
             self._handle_signal(signum)
 
     cdef _handle_signal(self, sig):
@@ -309,22 +439,18 @@ cdef class Loop:
             handle = None
 
         if handle is None:
-            # Some signal that we aren't listening through
-            # add_signal_handler.  Invoke CPython eval loop
-            # to let it being processed.
-            PyErr_CheckSignals()
-            _noop.noop()
+            self._ceval_process_signals()
             return
 
         if handle._cancelled:
             self.remove_signal_handler(sig)  # Remove it properly.
         else:
-            self._call_soon_handle(handle)
+            self._append_ready_handle(handle)
             self.handler_async.send()
 
     cdef _on_wake(self):
-        if (self._ready_len > 0 or self._stopping) \
-                            and not self.handler_idle.running:
+        if ((self._ready_len > 0 or self._stopping) and
+                not self.handler_idle.running):
             self.handler_idle.start()
 
     cdef _on_idle(self):
@@ -411,13 +537,12 @@ cdef class Loop:
         self._last_error = None
 
         self._thread_id = PyThread_get_thread_ident()
-        self._thread_is_main = MAIN_THREAD_ID == self._thread_id
         self._running = 1
 
         self.handler_check__exec_writes.start()
         self.handler_idle.start()
 
-        self._recv_signals_start()
+        self._setup_or_resume_signals()
 
         if aio_set_running_loop is not None:
             aio_set_running_loop(self)
@@ -427,12 +552,11 @@ cdef class Loop:
             if aio_set_running_loop is not None:
                 aio_set_running_loop(None)
 
-            self._recv_signals_stop()
-
             self.handler_check__exec_writes.stop()
             self.handler_idle.stop()
 
-            self._thread_is_main = 0
+            self._pause_signals()
+
             self._thread_id = 0
             self._running = 0
             self._stopping = 0
@@ -489,18 +613,17 @@ cdef class Loop:
 
         if self._timers:
             raise RuntimeError(
-                "new timers were queued during loop closing: {}"
-                    .format(self._timers))
+                f"new timers were queued during loop closing: {self._timers}")
 
         if self._polls:
             raise RuntimeError(
-                "new poll handles were queued during loop closing: {}"
-                    .format(self._polls))
+                f"new poll handles were queued during loop closing: "
+                f"{self._polls}")
 
         if self._ready:
             raise RuntimeError(
-                "new callbacks were queued during loop closing: {}"
-                    .format(self._ready))
+                f"new callbacks were queued during loop closing: "
+                f"{self._ready}")
 
         err = uv.uv_loop_close(self.uvloop)
         if err < 0:
@@ -510,6 +633,7 @@ cdef class Loop:
         self.handler_idle = None
         self.handler_check__exec_writes = None
 
+        self._executor_shutdown_called = True
         executor = self._default_executor
         if executor is not None:
             self._default_executor = None
@@ -533,41 +657,40 @@ cdef class Loop:
 
         cdef:
             UVStream stream
-            int queued_len
 
-        if UVLOOP_DEBUG:
-            queued_len = len(self._queued_streams)
-
-        for pystream in self._queued_streams:
-            stream = <UVStream>pystream
-            stream._exec_write()
-
-        if UVLOOP_DEBUG:
-            if len(self._queued_streams) != queued_len:
-                raise RuntimeError(
-                    'loop._queued_streams are not empty after '
-                    '_exec_queued_writes')
-
-        self._queued_streams.clear()
+        streams = self._queued_streams
+        self._queued_streams = self._executing_streams
+        self._executing_streams = streams
+        try:
+            for pystream in streams:
+                stream = <UVStream>pystream
+                stream._exec_write()
+        finally:
+            streams.clear()
 
         if self.handler_check__exec_writes.running:
-            self.handler_check__exec_writes.stop()
+            if len(self._queued_streams) == 0:
+                self.handler_check__exec_writes.stop()
 
-    cdef inline _call_soon(self, object callback, object args):
+    cdef inline _call_soon(self, object callback, object args, object context):
         cdef Handle handle
-        handle = new_Handle(self, callback, args)
+        handle = new_Handle(self, callback, args, context)
         self._call_soon_handle(handle)
         return handle
 
-    cdef inline _call_soon_handle(self, Handle handle):
+    cdef inline _append_ready_handle(self, Handle handle):
         self._check_closed()
         self._ready.append(handle)
-        self._ready_len += 1;
+        self._ready_len += 1
+
+    cdef inline _call_soon_handle(self, Handle handle):
+        self._append_ready_handle(handle)
         if not self.handler_idle.running:
             self.handler_idle.start()
 
-    cdef _call_later(self, uint64_t delay, object callback, object args):
-        return TimerHandle(self, callback, args, delay)
+    cdef _call_later(self, uint64_t delay, object callback, object args,
+                     object context):
+        return TimerHandle(self, callback, args, delay, context)
 
     cdef void _handle_exception(self, object ex):
         if isinstance(ex, Exception):
@@ -593,7 +716,10 @@ cdef class Loop:
     cdef inline _check_thread(self):
         if self._thread_id == 0:
             return
-        cdef long thread_id = PyThread_get_thread_ident()
+
+        cdef uint64_t thread_id
+        thread_id = <uint64_t>PyThread_get_thread_ident()
+
         if thread_id != self._thread_id:
             raise RuntimeError(
                 "Non-thread-safe operation invoked on an event loop other "
@@ -604,6 +730,12 @@ cdef class Loop:
 
     cdef _track_transport(self, UVBaseTransport transport):
         self._transports[transport._fileno()] = transport
+
+    cdef _track_process(self, UVProcess proc):
+        self._processes.add(proc)
+
+    cdef _untrack_process(self, UVProcess proc):
+        self._processes.discard(proc)
 
     cdef _fileobj_to_fd(self, fileobj):
         """Return a file descriptor from a file object.
@@ -656,8 +788,13 @@ cdef class Loop:
             poll = UVPoll.new(self, fd)
             self._polls[fd] = poll
 
-        self._fd_to_reader_fileobj[fd] = fileobj
         poll.start_reading(handle)
+
+        old_fileobj = self._fd_to_reader_fileobj.pop(fd, None)
+        if old_fileobj is not None:
+            socket_dec_io_ref(old_fileobj)
+
+        self._fd_to_reader_fileobj[fd] = fileobj
         socket_inc_io_ref(fileobj)
 
     cdef _remove_reader(self, fileobj):
@@ -666,8 +803,10 @@ cdef class Loop:
 
         fd = self._fileobj_to_fd(fileobj)
         self._ensure_fd_no_transport(fd)
-        self._fd_to_reader_fileobj.pop(fd, None)
-        socket_dec_io_ref(fileobj)
+
+        mapped_fileobj = self._fd_to_reader_fileobj.pop(fd, None)
+        if mapped_fileobj is not None:
+            socket_dec_io_ref(mapped_fileobj)
 
         if self._closed == 1:
             return False
@@ -684,6 +823,20 @@ cdef class Loop:
 
         return result
 
+    cdef _has_reader(self, fileobj):
+        cdef:
+            UVPoll poll
+
+        self._check_closed()
+        fd = self._fileobj_to_fd(fileobj)
+
+        try:
+            poll = <UVPoll>(self._polls[fd])
+        except KeyError:
+            return False
+
+        return poll.is_reading()
+
     cdef _add_writer(self, fileobj, Handle handle):
         cdef:
             UVPoll poll
@@ -698,8 +851,13 @@ cdef class Loop:
             poll = UVPoll.new(self, fd)
             self._polls[fd] = poll
 
-        self._fd_to_writer_fileobj[fd] = fileobj
         poll.start_writing(handle)
+
+        old_fileobj = self._fd_to_writer_fileobj.pop(fd, None)
+        if old_fileobj is not None:
+            socket_dec_io_ref(old_fileobj)
+
+        self._fd_to_writer_fileobj[fd] = fileobj
         socket_inc_io_ref(fileobj)
 
     cdef _remove_writer(self, fileobj):
@@ -708,8 +866,10 @@ cdef class Loop:
 
         fd = self._fileobj_to_fd(fileobj)
         self._ensure_fd_no_transport(fd)
-        self._fd_to_writer_fileobj.pop(fd, None)
-        socket_dec_io_ref(fileobj)
+
+        mapped_fileobj = self._fd_to_writer_fileobj.pop(fd, None)
+        if mapped_fileobj is not None:
+            socket_dec_io_ref(mapped_fileobj)
 
         if self._closed == 1:
             return False
@@ -725,6 +885,20 @@ cdef class Loop:
             poll._close()
 
         return result
+
+    cdef _has_writer(self, fileobj):
+        cdef:
+            UVPoll poll
+
+        self._check_closed()
+        fd = self._fileobj_to_fd(fileobj)
+
+        try:
+            poll = <UVPoll>(self._polls[fd])
+        except KeyError:
+            return False
+
+        return poll.is_writing()
 
     cdef _getaddrinfo(self, object host, object port,
                       int family, int type,
@@ -753,7 +927,9 @@ cdef class Loop:
                         data = result
                     else:
                         data = (<AddrInfo>result).unpack()
-                except Exception as ex:
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as ex:
                     if not fut.cancelled():
                         fut.set_exception(ex)
                 else:
@@ -781,12 +957,16 @@ cdef class Loop:
         return fut
 
     cdef _sock_recv(self, fut, sock, n):
-        cdef:
-            Handle handle
+        if UVLOOP_DEBUG:
+            if fut.cancelled():
+                # Shouldn't happen with _SyncSocketReaderFuture.
+                raise RuntimeError(
+                    f'_sock_recv is called on a cancelled Future')
 
-        if fut.cancelled():
-            self._remove_reader(sock)
-            return
+            if not self._has_reader(sock):
+                raise RuntimeError(
+                    f'socket {sock!r} does not have a reader '
+                    f'in the _sock_recv callback')
 
         try:
             data = sock.recv(n)
@@ -794,7 +974,9 @@ cdef class Loop:
             # No need to re-add the reader, let's just wait until
             # the poll handler calls this callback again.
             pass
-        except Exception as exc:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
             fut.set_exception(exc)
             self._remove_reader(sock)
         else:
@@ -802,12 +984,16 @@ cdef class Loop:
             self._remove_reader(sock)
 
     cdef _sock_recv_into(self, fut, sock, buf):
-        cdef:
-            Handle handle
+        if UVLOOP_DEBUG:
+            if fut.cancelled():
+                # Shouldn't happen with _SyncSocketReaderFuture.
+                raise RuntimeError(
+                    f'_sock_recv_into is called on a cancelled Future')
 
-        if fut.cancelled():
-            self._remove_reader(sock)
-            return
+            if not self._has_reader(sock):
+                raise RuntimeError(
+                    f'socket {sock!r} does not have a reader '
+                    f'in the _sock_recv_into callback')
 
         try:
             data = sock.recv_into(buf)
@@ -815,7 +1001,9 @@ cdef class Loop:
             # No need to re-add the reader, let's just wait until
             # the poll handler calls this callback again.
             pass
-        except Exception as exc:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
             fut.set_exception(exc)
             self._remove_reader(sock)
         else:
@@ -827,16 +1015,25 @@ cdef class Loop:
             Handle handle
             int n
 
-        if fut.cancelled():
-            self._remove_writer(sock)
-            return
+        if UVLOOP_DEBUG:
+            if fut.cancelled():
+                # Shouldn't happen with _SyncSocketWriterFuture.
+                raise RuntimeError(
+                    f'_sock_sendall is called on a cancelled Future')
+
+            if not self._has_writer(sock):
+                raise RuntimeError(
+                    f'socket {sock!r} does not have a writer '
+                    f'in the _sock_sendall callback')
 
         try:
             n = sock.send(data)
         except (BlockingIOError, InterruptedError):
             # Try next time.
             return
-        except Exception as exc:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
             fut.set_exception(exc)
             self._remove_writer(sock)
             return
@@ -855,19 +1052,13 @@ cdef class Loop:
                 self,
                 "Loop._sock_sendall",
                 <method3_t>self._sock_sendall,
+                None,
                 self,
                 fut, sock, data)
 
             self._add_writer(sock, handle)
 
     cdef _sock_accept(self, fut, sock):
-        cdef:
-            Handle handle
-
-        if fut.cancelled():
-            self._remove_reader(sock)
-            return
-
         try:
             conn, address = sock.accept()
             conn.setblocking(False)
@@ -875,42 +1066,49 @@ cdef class Loop:
             # There is an active reader for _sock_accept, so
             # do nothing, it will be called again.
             pass
-        except Exception as exc:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
             fut.set_exception(exc)
             self._remove_reader(sock)
         else:
             fut.set_result((conn, address))
             self._remove_reader(sock)
 
-    cdef _sock_connect(self, fut, sock, address):
+    cdef _sock_connect(self, sock, address):
         cdef:
             Handle handle
 
         try:
             sock.connect(address)
         except (BlockingIOError, InterruptedError):
-            # Issue #23618: When the C function connect() fails with EINTR, the
-            # connection runs in background. We have to wait until the socket
-            # becomes writable to be notified when the connection succeed or
-            # fails.
-            fut.add_done_callback(lambda fut: self._remove_writer(sock))
-
-            handle = new_MethodHandle3(
-                self,
-                "Loop._sock_connect",
-                <method3_t>self._sock_connect_cb,
-                self,
-                fut, sock, address)
-
-            self._add_writer(sock, handle)
-        except Exception as exc:
-            fut.set_exception(exc)
+            pass
         else:
-            fut.set_result(None)
+            return
+
+        fut = _SyncSocketWriterFuture(sock, self)
+        handle = new_MethodHandle3(
+            self,
+            "Loop._sock_connect",
+            <method3_t>self._sock_connect_cb,
+            None,
+            self,
+            fut, sock, address)
+
+        self._add_writer(sock, handle)
+        return fut
 
     cdef _sock_connect_cb(self, fut, sock, address):
-        if fut.cancelled():
-            return
+        if UVLOOP_DEBUG:
+            if fut.cancelled():
+                # Shouldn't happen with _SyncSocketWriterFuture.
+                raise RuntimeError(
+                    f'_sock_connect_cb is called on a cancelled Future')
+
+            if not self._has_writer(sock):
+                raise RuntimeError(
+                    f'socket {sock!r} does not have a writer '
+                    f'in the _sock_connect_cb callback')
 
         try:
             err = sock.getsockopt(uv.SOL_SOCKET, uv.SO_ERROR)
@@ -920,10 +1118,14 @@ cdef class Loop:
         except (BlockingIOError, InterruptedError):
             # socket is still registered, the callback will be retried later
             pass
-        except Exception as exc:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
             fut.set_exception(exc)
+            self._remove_writer(sock)
         else:
             fut.set_result(None)
+            self._remove_writer(sock)
 
     cdef _sock_set_reuseport(self, int fd):
         cdef:
@@ -940,96 +1142,43 @@ cdef class Loop:
         if err < 0:
             raise convert_error(-errno.errno)
 
-    cdef _set_coroutine_wrapper(self, bint enabled):
+    cdef _set_coroutine_debug(self, bint enabled):
         enabled = bool(enabled)
-        if self._coroutine_wrapper_set == enabled:
+        if self._coroutine_debug_set == enabled:
             return
 
-        wrapper = aio_debug_wrapper
-        current_wrapper = sys_get_coroutine_wrapper()
-
         if enabled:
-            if current_wrapper not in (None, wrapper):
-                warnings.warn(
-                    "loop.set_debug(True): cannot set debug coroutine "
-                    "wrapper; another wrapper is already set %r" %
-                    current_wrapper, RuntimeWarning)
-            else:
-                sys_set_coroutine_wrapper(wrapper)
-                self._coroutine_wrapper_set = True
+            self._coroutine_origin_tracking_saved_depth = (
+                sys.get_coroutine_origin_tracking_depth())
+            sys.set_coroutine_origin_tracking_depth(
+                DEBUG_STACK_DEPTH)
         else:
-            if current_wrapper not in (None, wrapper):
-                warnings.warn(
-                    "loop.set_debug(False): cannot unset debug coroutine "
-                    "wrapper; another wrapper was set %r" %
-                    current_wrapper, RuntimeWarning)
-            else:
-                sys_set_coroutine_wrapper(None)
-                self._coroutine_wrapper_set = False
+            sys.set_coroutine_origin_tracking_depth(
+                self._coroutine_origin_tracking_saved_depth)
 
-    cdef _create_server(self, system.sockaddr *addr,
-                        object protocol_factory,
-                        Server server,
-                        object ssl,
-                        bint reuse_port,
-                        object backlog):
-        cdef:
-            TCPServer tcp
-            int bind_flags
-
-        tcp = TCPServer.new(self, protocol_factory, server, ssl,
-                            addr.sa_family)
-
-        if reuse_port:
-            self._sock_set_reuseport(tcp._fileno())
-
-        if addr.sa_family == uv.AF_INET6:
-            # Disable IPv4/IPv6 dual stack support (enabled by
-            # default on Linux) which makes a single socket
-            # listen on both address families.
-            bind_flags = uv.UV_TCP_IPV6ONLY
-        else:
-            bind_flags = 0
-
-        try:
-            tcp.bind(addr, bind_flags)
-            tcp.listen(backlog)
-        except OSError as err:
-            pyaddr = __convert_sockaddr_to_pyaddr(addr)
-            tcp._close()
-            raise OSError(err.errno, 'error while attempting '
-                          'to bind on address %r: %s'
-                          % (pyaddr, err.strerror.lower()))
-        except:
-            tcp._close()
-            raise
-
-        return tcp
+        self._coroutine_debug_set = enabled
 
     def _get_backend_id(self):
         """This method is used by uvloop tests and is not part of the API."""
         return uv.uv_backend_fd(self.uvloop)
 
-    def print_debug_info(self):
+    cdef _print_debug_info(self):
         cdef:
             int err
             uv.uv_rusage_t rusage
-
-        if not UVLOOP_DEBUG:
-            raise NotImplementedError
 
         err = uv.uv_getrusage(&rusage)
         if err < 0:
             raise convert_error(err)
 
-        ################### OS
+        # OS
 
         print('---- Process info: -----')
         print('Process memory:            {}'.format(rusage.ru_maxrss))
         print('Number of signals:         {}'.format(rusage.ru_nsignals))
         print('')
 
-        ################### Loop
+        # Loop
 
         print('--- Loop debug info: ---')
         print('Loop time:                 {}'.format(self.time()))
@@ -1107,17 +1256,25 @@ cdef class Loop:
 
         print(flush=True)
 
+    property print_debug_info:
+        def __get__(self):
+            if UVLOOP_DEBUG:
+                return lambda: self._print_debug_info()
+            else:
+                raise AttributeError('print_debug_info')
+
     # Public API
 
     def __repr__(self):
         return '<{}.{} running={} closed={} debug={}>'.format(
-                    self.__class__.__module__,
-                    self.__class__.__name__,
-                    self.is_running(),
-                    self.is_closed(),
-                    self.get_debug())
+            self.__class__.__module__,
+            self.__class__.__name__,
+            self.is_running(),
+            self.is_closed(),
+            self.get_debug()
+        )
 
-    def call_soon(self, callback, *args):
+    def call_soon(self, callback, *args, context=None):
         """Arrange for a callback to be called as soon as possible.
 
         This operates as a FIFO queue: callbacks are called in the
@@ -1130,19 +1287,23 @@ cdef class Loop:
         if self._debug == 1:
             self._check_thread()
         if args:
-            return self._call_soon(callback, args)
+            return self._call_soon(callback, args, context)
         else:
-            return self._call_soon(callback, None)
+            return self._call_soon(callback, None, context)
 
-    def call_soon_threadsafe(self, callback, *args):
+    def call_soon_threadsafe(self, callback, *args, context=None):
         """Like call_soon(), but thread-safe."""
         if not args:
             args = None
-        handle = self._call_soon(callback, args)
+        cdef Handle handle = new_Handle(self, callback, args, context)
+        self._append_ready_handle(handle)  # deque append is atomic
+        # libuv async handler is thread-safe while the idle handler is not -
+        # we only set the async handler here, which will start the idle handler
+        # in _on_wake() from the loop and eventually call the callback.
         self.handler_async.send()
         return handle
 
-    def call_later(self, delay, callback, *args):
+    def call_later(self, delay, callback, *args, context=None):
         """Arrange for a callback to be called at a given time.
 
         Return a Handle: an opaque object with a cancel() method that
@@ -1166,25 +1327,26 @@ cdef class Loop:
 
         if delay < 0:
             delay = 0
-        elif delay == py_inf:
+        elif delay == py_inf or delay > MAX_SLEEP:
             # ~100 years sounds like a good approximation of
             # infinity for a Python application.
-            delay = 3600 * 24 * 365 * 100
+            delay = MAX_SLEEP
 
-        when = <uint64_t>(delay * 1000)
+        when = <uint64_t>round(delay * 1000)
         if not args:
             args = None
         if when == 0:
-            return self._call_soon(callback, args)
+            return self._call_soon(callback, args, context)
         else:
-            return self._call_later(when, callback, args)
+            return self._call_later(when, callback, args, context)
 
-    def call_at(self, when, callback, *args):
+    def call_at(self, when, callback, *args, context=None):
         """Like call_later(), but uses an absolute time.
 
         Absolute time corresponds to the event loop's time() method.
         """
-        return self.call_later(when - self.time(), callback, *args)
+        return self.call_later(
+            when - self.time(), callback, *args, context=context)
 
     def time(self):
         """Return the time according to the event loop's clock.
@@ -1206,6 +1368,7 @@ cdef class Loop:
                 self,
                 "Loop._stop",
                 <method1_t>self._stop,
+                None,
                 self,
                 None))
 
@@ -1217,17 +1380,15 @@ cdef class Loop:
             # loop.stop() was called right before loop.run_forever().
             # This is how asyncio loop behaves.
             mode = uv.UV_RUN_NOWAIT
-        self._set_coroutine_wrapper(self._debug)
-        if self._asyncgens is not None:
-            old_agen_hooks = sys.get_asyncgen_hooks()
-            sys.set_asyncgen_hooks(firstiter=self._asyncgen_firstiter_hook,
-                                   finalizer=self._asyncgen_finalizer_hook)
+        self._set_coroutine_debug(self._debug)
+        old_agen_hooks = sys.get_asyncgen_hooks()
+        sys.set_asyncgen_hooks(firstiter=self._asyncgen_firstiter_hook,
+                               finalizer=self._asyncgen_finalizer_hook)
         try:
             self._run(mode)
         finally:
-            self._set_coroutine_wrapper(False)
-            if self._asyncgens is not None:
-                sys.set_asyncgen_hooks(*old_agen_hooks)
+            self._set_coroutine_debug(False)
+            sys.set_asyncgen_hooks(*old_agen_hooks)
 
     def close(self):
         """Close the event loop.
@@ -1246,7 +1407,8 @@ cdef class Loop:
     def set_debug(self, enabled):
         self._debug = bool(enabled)
         if self.is_running():
-            self._set_coroutine_wrapper(self._debug)
+            self.call_soon_threadsafe(
+                self._set_coroutine_debug, self, self._debug)
 
     def is_running(self):
         """Return whether the event loop is currently running."""
@@ -1260,16 +1422,45 @@ cdef class Loop:
         """Create a Future object attached to the loop."""
         return self._new_future()
 
-    def create_task(self, coro):
+    def create_task(self, coro, *, name=None, context=None):
         """Schedule a coroutine object.
 
         Return a task object.
+
+        If name is not None, task.set_name(name) will be called if the task
+        object has the set_name attribute, true for default Task in Python 3.8.
+
+        An optional keyword-only context argument allows specifying a custom
+        contextvars.Context for the coro to run in. The current context copy is
+        created when no context is provided.
         """
         self._check_closed()
-        if self._task_factory is None:
-            task = aio_Task(coro, loop=self)
+        if PY311:
+            if self._task_factory is None:
+                task = aio_Task(coro, loop=self, context=context)
+            else:
+                task = self._task_factory(self, coro, context=context)
         else:
-            task = self._task_factory(self, coro)
+            if context is None:
+                if self._task_factory is None:
+                    task = aio_Task(coro, loop=self)
+                else:
+                    task = self._task_factory(self, coro)
+            else:
+                if self._task_factory is None:
+                    task = context.run(aio_Task, coro, self)
+                else:
+                    task = context.run(self._task_factory, self, coro)
+
+        # copied from asyncio.tasks._set_task_name (bpo-34270)
+        if name is not None:
+            try:
+                set_name = task.set_name
+            except AttributeError:
+                pass
+            else:
+                set_name(name)
+
         return task
 
     def set_task_factory(self, factory):
@@ -1310,12 +1501,19 @@ cdef class Loop:
             # is no need to log the "destroy pending task" message
             future._log_destroy_pending = False
 
-        done_cb = lambda fut: self.stop()
+        def done_cb(fut):
+            if not fut.cancelled():
+                exc = fut.exception()
+                if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                    # Issue #336: run_forever() already finished,
+                    # no need to stop it.
+                    return
+            self.stop()
 
         future.add_done_callback(done_cb)
         try:
             self.run_forever()
-        except:
+        except BaseException:
             if new_task and future.done() and not future.cancelled():
                 # The coroutine raised a BaseException. Consume the exception
                 # to not log a warning, the caller doesn't have access to the
@@ -1329,18 +1527,19 @@ cdef class Loop:
 
         return future.result()
 
-    def getaddrinfo(self, object host, object port, *,
-                    int family=0, int type=0, int proto=0, int flags=0):
+    @cython.iterable_coroutine
+    async def getaddrinfo(self, object host, object port, *,
+                          int family=0, int type=0, int proto=0, int flags=0):
 
         addr = __static_getaddrinfo_pyaddr(host, port, family,
                                            type, proto, flags)
         if addr is not None:
-            fut = self._new_future()
-            fut.set_result([addr])
-            return fut
+            return [addr]
 
-        return self._getaddrinfo(host, port, family, type, proto, flags, 1)
+        return await self._getaddrinfo(
+            host, port, family, type, proto, flags, 1)
 
+    @cython.iterable_coroutine
     async def getnameinfo(self, sockaddr, int flags=0):
         cdef:
             AddrInfo ai_cnt
@@ -1358,11 +1557,8 @@ cdef class Loop:
         if sl > 2:
             flowinfo = sockaddr[2]
             if flowinfo < 0 or flowinfo > 0xfffff:
-                if sys_version_info >= (3, 7, 0):
-                    msg = 'getnameinfo(): flowinfo must be 0-1048575.'
-                else:
-                    msg = 'getsockaddrarg: flowinfo must be 0-1048575.'
-                raise OverflowError(msg)
+                raise OverflowError(
+                    'getnameinfo(): flowinfo must be 0-1048575.')
         else:
             flowinfo = 0
 
@@ -1398,6 +1594,63 @@ cdef class Loop:
 
         return await self._getnameinfo(ai.ai_addr, flags)
 
+    @cython.iterable_coroutine
+    async def start_tls(self, transport, protocol, sslcontext, *,
+                        server_side=False,
+                        server_hostname=None,
+                        ssl_handshake_timeout=None,
+                        ssl_shutdown_timeout=None):
+        """Upgrade transport to TLS.
+
+        Return a new transport that *protocol* should start using
+        immediately.
+        """
+        if not isinstance(sslcontext, ssl_SSLContext):
+            raise TypeError(
+                f'sslcontext is expected to be an instance of ssl.SSLContext, '
+                f'got {sslcontext!r}')
+
+        if isinstance(transport, (TCPTransport, UnixTransport)):
+            context = (<UVStream>transport).context
+        elif isinstance(transport, _SSLProtocolTransport):
+            context = (<_SSLProtocolTransport>transport).context
+        else:
+            raise TypeError(
+                f'transport {transport!r} is not supported by start_tls()')
+
+        waiter = self._new_future()
+        ssl_protocol = SSLProtocol(
+            self, protocol, sslcontext, waiter,
+            server_side, server_hostname,
+            ssl_handshake_timeout=ssl_handshake_timeout,
+            ssl_shutdown_timeout=ssl_shutdown_timeout,
+            call_connection_made=False)
+
+        # Pause early so that "ssl_protocol.data_received()" doesn't
+        # have a chance to get called before "ssl_protocol.connection_made()".
+        transport.pause_reading()
+
+        transport.set_protocol(ssl_protocol)
+        conmade_cb = self.call_soon(ssl_protocol.connection_made, transport,
+                                    context=context)
+        # transport.resume_reading() will use the right context
+        # (transport.context) to call e.g. data_received()
+        resume_cb = self.call_soon(transport.resume_reading)
+        app_transport = ssl_protocol._get_app_transport(context)
+
+        try:
+            await waiter
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            app_transport.close()
+            conmade_cb.cancel()
+            resume_cb.cancel()
+            raise
+
+        return app_transport
+
+    @cython.iterable_coroutine
     async def create_server(self, protocol_factory, host=None, port=None,
                             *,
                             int family=uv.AF_UNSPEC,
@@ -1405,8 +1658,11 @@ cdef class Loop:
                             sock=None,
                             backlog=100,
                             ssl=None,
-                            reuse_address=None,  # ignored, libuv sets it
-                            reuse_port=None):
+                            reuse_address=None,
+                            reuse_port=None,
+                            ssl_handshake_timeout=None,
+                            ssl_shutdown_timeout=None,
+                            start_serving=True):
         """A coroutine which creates a TCP server bound to host and port.
 
         The return value is a Server object which can be used to stop
@@ -1414,8 +1670,8 @@ cdef class Loop:
 
         If host is an empty string or None all interfaces are assumed
         and a list of multiple sockets will be returned (most likely
-        one for IPv4 and another one for IPv6). The host parameter can also be a
-        sequence (e.g. list) of hosts to bind to.
+        one for IPv4 and another one for IPv6). The host parameter can also be
+        a sequence (e.g. list) of hosts to bind to.
 
         family can be set to either AF_INET or AF_INET6 to force the
         socket to use IPv4 or IPv6. If not set it will be determined
@@ -1441,6 +1697,14 @@ cdef class Loop:
         the same port as other existing endpoints are bound to, so long as
         they all set this flag when being created. This option is not
         supported on Windows.
+
+        ssl_handshake_timeout is the time in seconds that an SSL server
+        will wait for completion of the SSL handshake before aborting the
+        connection. Default is 60s.
+
+        ssl_shutdown_timeout is the time in seconds that an SSL server
+        will wait for completion of the SSL shutdown before aborting the
+        connection. Default is 30s.
         """
         cdef:
             TCPServer tcp
@@ -1452,18 +1716,29 @@ cdef class Loop:
                 raise ValueError(
                     'host/port and sock can not be specified at the same time')
             return await self.create_unix_server(
-                protocol_factory, sock=sock, ssl=ssl)
+                protocol_factory, sock=sock, backlog=backlog, ssl=ssl,
+                start_serving=start_serving)
 
         server = Server(self)
 
-        if ssl is not None and not isinstance(ssl, ssl_SSLContext):
-            raise TypeError('ssl argument must be an SSLContext or None')
+        if ssl is not None:
+            if not isinstance(ssl, ssl_SSLContext):
+                raise TypeError('ssl argument must be an SSLContext or None')
+        else:
+            if ssl_handshake_timeout is not None:
+                raise ValueError(
+                    'ssl_handshake_timeout is only meaningful with ssl')
+            if ssl_shutdown_timeout is not None:
+                raise ValueError(
+                    'ssl_shutdown_timeout is only meaningful with ssl')
 
         if host is not None or port is not None:
             if sock is not None:
                 raise ValueError(
                     'host/port and sock can not be specified at the same time')
 
+            if reuse_address is None:
+                reuse_address = os_name == 'posix' and sys_platform != 'cygwin'
             reuse_port = bool(reuse_port)
             if reuse_port and not has_SO_REUSEPORT:
                 raise ValueError(
@@ -1480,9 +1755,10 @@ cdef class Loop:
                                     uv.SOCK_STREAM, 0, flags,
                                     0) for host in hosts]
 
-            infos = await aio_gather(*fs, loop=self)
+            infos = await aio_gather(*fs)
 
             completed = False
+            sock = None
             try:
                 for info in infos:
                     addrinfo = (<AddrInfo>info).data
@@ -1490,17 +1766,67 @@ cdef class Loop:
                         if addrinfo.ai_family == uv.AF_UNSPEC:
                             raise RuntimeError('AF_UNSPEC in DNS results')
 
-                        tcp = self._create_server(
-                            addrinfo.ai_addr, protocol_factory, server,
-                            ssl, reuse_port, backlog)
+                        try:
+                            sock = socket_socket(addrinfo.ai_family,
+                                                 addrinfo.ai_socktype,
+                                                 addrinfo.ai_protocol)
+                        except socket_error:
+                            # Assume it's a bad family/type/protocol
+                            # combination.
+                            if self._debug:
+                                aio_logger.warning(
+                                    'create_server() failed to create '
+                                    'socket.socket(%r, %r, %r)',
+                                    addrinfo.ai_family,
+                                    addrinfo.ai_socktype,
+                                    addrinfo.ai_protocol, exc_info=True)
+                            addrinfo = addrinfo.ai_next
+                            continue
 
-                        server._add_server(<TCPServer>tcp)
+                        if reuse_address:
+                            sock.setsockopt(uv.SOL_SOCKET, uv.SO_REUSEADDR, 1)
+                        if reuse_port:
+                            sock.setsockopt(uv.SOL_SOCKET, uv.SO_REUSEPORT, 1)
+                        # Disable IPv4/IPv6 dual stack support (enabled by
+                        # default on Linux) which makes a single socket
+                        # listen on both address families.
+                        if (addrinfo.ai_family == uv.AF_INET6 and
+                                has_IPV6_V6ONLY):
+                            sock.setsockopt(uv.IPPROTO_IPV6, IPV6_V6ONLY, 1)
+
+                        pyaddr = __convert_sockaddr_to_pyaddr(addrinfo.ai_addr)
+                        try:
+                            sock.bind(pyaddr)
+                        except OSError as err:
+                            raise OSError(
+                                err.errno, 'error while attempting '
+                                'to bind on address %r: %s'
+                                % (pyaddr, err.strerror.lower())) from None
+
+                        tcp = TCPServer.new(self, protocol_factory, server,
+                                            uv.AF_UNSPEC, backlog,
+                                            ssl, ssl_handshake_timeout,
+                                            ssl_shutdown_timeout)
+
+                        try:
+                            tcp._open(sock.fileno())
+                        except (KeyboardInterrupt, SystemExit):
+                            raise
+                        except BaseException:
+                            tcp._close()
+                            raise
+
+                        server._add_server(tcp)
+                        sock.detach()
+                        sock = None
 
                         addrinfo = addrinfo.ai_next
 
                 completed = True
             finally:
                 if not completed:
+                    if sock is not None:
+                        sock.close()
                     server.close()
         else:
             if sock is None:
@@ -1513,25 +1839,36 @@ cdef class Loop:
             # we want Python socket object to notice that.
             sock.setblocking(False)
 
-            tcp = TCPServer.new(self, protocol_factory, server, ssl,
-                                uv.AF_UNSPEC)
+            tcp = TCPServer.new(self, protocol_factory, server,
+                                uv.AF_UNSPEC, backlog,
+                                ssl, ssl_handshake_timeout,
+                                ssl_shutdown_timeout)
 
             try:
                 tcp._open(sock.fileno())
-                tcp.listen(backlog)
-            except:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
                 tcp._close()
                 raise
 
             tcp._attach_fileobj(sock)
             server._add_server(tcp)
 
+        if start_serving:
+            server._start_serving()
+
         server._ref()
         return server
 
-    async def create_connection(self, protocol_factory, host=None, port=None, *,
-                                ssl=None, family=0, proto=0, flags=0, sock=None,
-                                local_addr=None, server_hostname=None):
+    @cython.iterable_coroutine
+    async def create_connection(self, protocol_factory, host=None, port=None,
+                                *,
+                                ssl=None,
+                                family=0, proto=0, flags=0, sock=None,
+                                local_addr=None, server_hostname=None,
+                                ssl_handshake_timeout=None,
+                                ssl_shutdown_timeout=None):
         """Connect to a TCP server.
 
         Create a streaming transport connection to a given Internet host and
@@ -1560,6 +1897,7 @@ cdef class Loop:
             system.sockaddr_storage lai_addr_static
 
             object app_protocol
+            object app_transport
             object protocol
             object ssl_waiter
 
@@ -1573,6 +1911,7 @@ cdef class Loop:
 
         app_protocol = protocol = protocol_factory()
         ssl_waiter = None
+        context = Context_CopyCurrent()
         if ssl:
             if server_hostname is None:
                 if not host:
@@ -1582,12 +1921,20 @@ cdef class Loop:
 
             ssl_waiter = self._new_future()
             sslcontext = None if isinstance(ssl, bool) else ssl
-            protocol = aio_SSLProtocol(
+            protocol = SSLProtocol(
                 self, app_protocol, sslcontext, ssl_waiter,
-                False, server_hostname)
+                False, server_hostname,
+                ssl_handshake_timeout=ssl_handshake_timeout,
+                ssl_shutdown_timeout=ssl_shutdown_timeout)
         else:
             if server_hostname is not None:
                 raise ValueError('server_hostname is only meaningful with ssl')
+            if ssl_handshake_timeout is not None:
+                raise ValueError(
+                    'ssl_handshake_timeout is only meaningful with ssl')
+            if ssl_shutdown_timeout is not None:
+                raise ValueError(
+                    'ssl_shutdown_timeout is only meaningful with ssl')
 
         if host is not None or port is not None:
             if sock is not None:
@@ -1598,8 +1945,9 @@ cdef class Loop:
             f1 = f2 = None
 
             addr = __static_getaddrinfo(
-                    host, port, family, uv.SOCK_STREAM,
-                    proto, <system.sockaddr*>&rai_addr_static)
+                host, port, family, uv.SOCK_STREAM,
+                proto, <system.sockaddr*>&rai_addr_static)
+
             if addr is None:
                 f1 = self._getaddrinfo(
                     host, port, family,
@@ -1635,7 +1983,7 @@ cdef class Loop:
                     lai = &lai_static
 
             if len(fs):
-                await aio_wait(fs, loop=self)
+                await aio_wait(fs)
 
             if rai is NULL:
                 ai_remote = f1.result()
@@ -1656,7 +2004,8 @@ cdef class Loop:
                 tr = None
                 try:
                     waiter = self._new_future()
-                    tr = TCPTransport.new(self, protocol, None, waiter)
+                    tr = TCPTransport.new(self, protocol, None, waiter,
+                                          context)
 
                     if lai is not NULL:
                         lai_iter = lai
@@ -1682,7 +2031,9 @@ cdef class Loop:
                         tr._close()
                         tr = None
                     exceptions.append(exc)
-                except:
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException:
                     if tr is not None:
                         tr._close()
                         tr = None
@@ -1714,26 +2065,44 @@ cdef class Loop:
             sock.setblocking(False)
 
             waiter = self._new_future()
-            tr = TCPTransport.new(self, protocol, None, waiter)
+            tr = TCPTransport.new(self, protocol, None, waiter, context)
             try:
                 # libuv will make socket non-blocking
                 tr._open(sock.fileno())
                 tr._init_protocol()
                 await waiter
-            except:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
+                # It's OK to call `_close()` here, as opposed to
+                # `_force_close()` or `close()` as we want to terminate the
+                # transport immediately.  The `waiter` can only be waken
+                # up in `Transport._call_connection_made()`, and calling
+                # `_close()` before it is fine.
                 tr._close()
                 raise
 
             tr._attach_fileobj(sock)
 
         if ssl:
-            await ssl_waiter
-            return protocol._app_transport, app_protocol
+            app_transport = protocol._get_app_transport(context)
+            try:
+                await ssl_waiter
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
+                app_transport.close()
+                raise
+            return app_transport, app_protocol
         else:
             return tr, protocol
 
+    @cython.iterable_coroutine
     async def create_unix_server(self, protocol_factory, path=None,
-                                 *, backlog=100, sock=None, ssl=None):
+                                 *, backlog=100, sock=None, ssl=None,
+                                 ssl_handshake_timeout=None,
+                                 ssl_shutdown_timeout=None,
+                                 start_serving=True):
         """A coroutine which creates a UNIX Domain Socket server.
 
         The return value is a Server object, which can be used to stop
@@ -1750,13 +2119,29 @@ cdef class Loop:
 
         ssl can be set to an SSLContext to enable SSL over the
         accepted connections.
+
+        ssl_handshake_timeout is the time in seconds that an SSL server
+        will wait for completion of the SSL handshake before aborting the
+        connection. Default is 60s.
+
+        ssl_shutdown_timeout is the time in seconds that an SSL server
+        will wait for completion of the SSL shutdown before aborting the
+        connection. Default is 30s.
         """
         cdef:
             UnixServer pipe
             Server server = Server(self)
 
-        if ssl is not None and not isinstance(ssl, ssl_SSLContext):
-            raise TypeError('ssl argument must be an SSLContext or None')
+        if ssl is not None:
+            if not isinstance(ssl, ssl_SSLContext):
+                raise TypeError('ssl argument must be an SSLContext or None')
+        else:
+            if ssl_handshake_timeout is not None:
+                raise ValueError(
+                    'ssl_handshake_timeout is only meaningful with ssl')
+            if ssl_shutdown_timeout is not None:
+                raise ValueError(
+                    'ssl_shutdown_timeout is only meaningful with ssl')
 
         if path is not None:
             if sock is not None:
@@ -1764,14 +2149,7 @@ cdef class Loop:
                     'path and sock can not be specified at the same time')
             orig_path = path
 
-            try:
-                # Lookup __fspath__ manually, as os.fspath() isn't
-                # available on Python 3.5.
-                fspath = type(path).__fspath__
-            except AttributeError:
-                pass
-            else:
-                path = fspath(path)
+            path = os_fspath(path)
 
             if isinstance(path, str):
                 path = PyUnicode_EncodeFSDefault(path)
@@ -1806,7 +2184,9 @@ cdef class Loop:
                     raise OSError(errno.EADDRINUSE, msg) from None
                 else:
                     raise
-            except:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
                 sock.close()
                 raise
 
@@ -1824,37 +2204,44 @@ cdef class Loop:
             # we want Python socket object to notice that.
             sock.setblocking(False)
 
-        pipe = UnixServer.new(self, protocol_factory, server, ssl)
+        pipe = UnixServer.new(
+            self, protocol_factory, server, backlog,
+            ssl, ssl_handshake_timeout, ssl_shutdown_timeout)
 
         try:
             pipe._open(sock.fileno())
-        except:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
             pipe._close()
             sock.close()
             raise
 
-        try:
-            pipe.listen(backlog)
-        except:
-            pipe._close()
-            raise
-
         pipe._attach_fileobj(sock)
         server._add_server(pipe)
+
+        if start_serving:
+            server._start_serving()
+
         return server
 
+    @cython.iterable_coroutine
     async def create_unix_connection(self, protocol_factory, path=None, *,
                                      ssl=None, sock=None,
-                                     server_hostname=None):
+                                     server_hostname=None,
+                                     ssl_handshake_timeout=None,
+                                     ssl_shutdown_timeout=None):
 
         cdef:
             UnixTransport tr
             object app_protocol
+            object app_transport
             object protocol
             object ssl_waiter
 
         app_protocol = protocol = protocol_factory()
         ssl_waiter = None
+        context = Context_CopyCurrent()
         if ssl:
             if server_hostname is None:
                 raise ValueError('You must set server_hostname '
@@ -1862,36 +2249,39 @@ cdef class Loop:
 
             ssl_waiter = self._new_future()
             sslcontext = None if isinstance(ssl, bool) else ssl
-            protocol = aio_SSLProtocol(
+            protocol = SSLProtocol(
                 self, app_protocol, sslcontext, ssl_waiter,
-                False, server_hostname)
+                False, server_hostname,
+                ssl_handshake_timeout=ssl_handshake_timeout,
+                ssl_shutdown_timeout=ssl_shutdown_timeout)
         else:
             if server_hostname is not None:
                 raise ValueError('server_hostname is only meaningful with ssl')
+            if ssl_handshake_timeout is not None:
+                raise ValueError(
+                    'ssl_handshake_timeout is only meaningful with ssl')
+            if ssl_shutdown_timeout is not None:
+                raise ValueError(
+                    'ssl_shutdown_timeout is only meaningful with ssl')
 
         if path is not None:
             if sock is not None:
                 raise ValueError(
                     'path and sock can not be specified at the same time')
 
-            try:
-                # Lookup __fspath__ manually, as os.fspath() isn't
-                # available on Python 3.5.
-                fspath = type(path).__fspath__
-            except AttributeError:
-                pass
-            else:
-                path = fspath(path)
+            path = os_fspath(path)
 
             if isinstance(path, str):
                 path = PyUnicode_EncodeFSDefault(path)
 
             waiter = self._new_future()
-            tr = UnixTransport.new(self, protocol, None, waiter)
+            tr = UnixTransport.new(self, protocol, None, waiter, context)
             tr.connect(path)
             try:
                 await waiter
-            except:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
                 tr._close()
                 raise
 
@@ -1909,20 +2299,29 @@ cdef class Loop:
             sock.setblocking(False)
 
             waiter = self._new_future()
-            tr = UnixTransport.new(self, protocol, None, waiter)
+            tr = UnixTransport.new(self, protocol, None, waiter, context)
             try:
                 tr._open(sock.fileno())
                 tr._init_protocol()
                 await waiter
-            except:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
                 tr._close()
                 raise
 
             tr._attach_fileobj(sock)
 
         if ssl:
-            await ssl_waiter
-            return protocol._app_transport, app_protocol
+            app_transport = protocol._get_app_transport(Context_CopyCurrent())
+            try:
+                await ssl_waiter
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
+                app_transport.close()
+                raise
+            return app_transport, app_protocol
         else:
             return tr, protocol
 
@@ -1958,7 +2357,9 @@ cdef class Loop:
             else:
                 try:
                     value = repr(value)
-                except Exception as ex:
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as ex:
                     value = ('Exception in __repr__ {!r}; '
                              'value type: {!r}'.format(ex, type(value)))
             log_lines.append('{}: {}'.format(key, value))
@@ -2012,7 +2413,9 @@ cdef class Loop:
         if self._exception_handler is None:
             try:
                 self.default_exception_handler(context)
-            except Exception:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
                 # Second protection layer for unexpected errors
                 # in the default implementation, as well as for subclassed
                 # event loops with overloaded "default_exception_handler".
@@ -2021,7 +2424,9 @@ cdef class Loop:
         else:
             try:
                 self._exception_handler(self, context)
-            except Exception as exc:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
                 # Exception in the user set custom exception handler.
                 try:
                     # Let's try default handler.
@@ -2030,7 +2435,9 @@ cdef class Loop:
                         'exception': exc,
                         'context': context,
                     })
-                except Exception:
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException:
                     # Guard 'default_exception_handler' in case it is
                     # overloaded.
                     aio_logger.error('Exception in default exception handler '
@@ -2042,7 +2449,7 @@ cdef class Loop:
         """Add a reader callback."""
         if len(args) == 0:
             args = None
-        self._add_reader(fileobj, new_Handle(self, callback, args))
+        self._add_reader(fileobj, new_Handle(self, callback, args, None))
 
     def remove_reader(self, fileobj):
         """Remove a reader callback."""
@@ -2052,13 +2459,14 @@ cdef class Loop:
         """Add a writer callback.."""
         if len(args) == 0:
             args = None
-        self._add_writer(fileobj, new_Handle(self, callback, args))
+        self._add_writer(fileobj, new_Handle(self, callback, args, None))
 
     def remove_writer(self, fileobj):
         """Remove a writer callback."""
         self._remove_writer(fileobj)
 
-    def sock_recv(self, sock, n):
+    @cython.iterable_coroutine
+    async def sock_recv(self, sock, n):
         """Receive data from the socket.
 
         The return value is a bytes object representing the data received.
@@ -2073,18 +2481,20 @@ cdef class Loop:
         if self._debug and sock.gettimeout() != 0:
             raise ValueError("the socket must be non-blocking")
 
-        fut = self._new_future()
+        fut = _SyncSocketReaderFuture(sock, self)
         handle = new_MethodHandle3(
             self,
             "Loop._sock_recv",
             <method3_t>self._sock_recv,
+            None,
             self,
             fut, sock, n)
 
         self._add_reader(sock, handle)
-        return fut
+        return await fut
 
-    def sock_recv_into(self, sock, buf):
+    @cython.iterable_coroutine
+    async def sock_recv_into(self, sock, buf):
         """Receive data from the socket.
 
         The received data is written into *buf* (a writable buffer).
@@ -2098,17 +2508,19 @@ cdef class Loop:
         if self._debug and sock.gettimeout() != 0:
             raise ValueError("the socket must be non-blocking")
 
-        fut = self._new_future()
+        fut = _SyncSocketReaderFuture(sock, self)
         handle = new_MethodHandle3(
             self,
             "Loop._sock_recv_into",
             <method3_t>self._sock_recv_into,
+            None,
             self,
             fut, sock, buf)
 
         self._add_reader(sock, handle)
-        return fut
+        return await fut
 
+    @cython.iterable_coroutine
     async def sock_sendall(self, sock, data):
         """Send data to the socket.
 
@@ -2122,7 +2534,7 @@ cdef class Loop:
         """
         cdef:
             Handle handle
-            int n
+            ssize_t n
 
         if self._debug and sock.gettimeout() != 0:
             raise ValueError("the socket must be non-blocking")
@@ -2148,11 +2560,12 @@ cdef class Loop:
                     data = memoryview(data)
                 data = data[n:]
 
-            fut = self._new_future()
+            fut = _SyncSocketWriterFuture(sock, self)
             handle = new_MethodHandle3(
                 self,
                 "Loop._sock_sendall",
                 <method3_t>self._sock_sendall,
+                None,
                 self,
                 fut, sock, data)
 
@@ -2161,7 +2574,8 @@ cdef class Loop:
         finally:
             socket_dec_io_ref(sock)
 
-    def sock_accept(self, sock):
+    @cython.iterable_coroutine
+    async def sock_accept(self, sock):
         """Accept a connection.
 
         The socket must be bound to an address and listening for connections.
@@ -2177,17 +2591,19 @@ cdef class Loop:
         if self._debug and sock.gettimeout() != 0:
             raise ValueError("the socket must be non-blocking")
 
-        fut = self._new_future()
+        fut = _SyncSocketReaderFuture(sock, self)
         handle = new_MethodHandle2(
             self,
             "Loop._sock_accept",
             <method2_t>self._sock_accept,
+            None,
             self,
             fut, sock)
 
         self._add_reader(sock, handle)
-        return fut
+        return await fut
 
+    @cython.iterable_coroutine
     async def sock_connect(self, sock, address):
         """Connect to a remote socket at address.
 
@@ -2198,20 +2614,36 @@ cdef class Loop:
 
         socket_inc_io_ref(sock)
         try:
-            fut = self._new_future()
             if sock.family == uv.AF_UNIX:
-                self._sock_connect(fut, sock, address)
-                await fut
-                return
+                fut = self._sock_connect(sock, address)
+            else:
+                addrs = await self.getaddrinfo(
+                    *address[:2], family=sock.family)
 
-            _, _, _, _, address = (await self.getaddrinfo(*address[:2]))[0]
-            self._sock_connect(fut, sock, address)
-            await fut
+                _, _, _, _, address = addrs[0]
+                fut = self._sock_connect(sock, address)
+            if fut is not None:
+                await fut
         finally:
             socket_dec_io_ref(sock)
 
+    @cython.iterable_coroutine
+    async def sock_recvfrom(self, sock, bufsize):
+        raise NotImplementedError
+
+    @cython.iterable_coroutine
+    async def sock_recvfrom_into(self, sock, buf, nbytes=0):
+        raise NotImplementedError
+
+    @cython.iterable_coroutine
+    async def sock_sendto(self, sock, data, address):
+        raise NotImplementedError
+
+    @cython.iterable_coroutine
     async def connect_accepted_socket(self, protocol_factory, sock, *,
-                                      ssl=None):
+                                      ssl=None,
+                                      ssl_handshake_timeout=None,
+                                      ssl_shutdown_timeout=None):
         """Handle an accepted connection.
 
         This is used by servers that accept connections outside of
@@ -2224,8 +2656,17 @@ cdef class Loop:
         cdef:
             UVStream transport = None
 
-        if ssl is not None and not isinstance(ssl, ssl_SSLContext):
-            raise TypeError('ssl argument must be an SSLContext or None')
+        if ssl is not None:
+            if not isinstance(ssl, ssl_SSLContext):
+                raise TypeError('ssl argument must be an SSLContext or None')
+        else:
+            if ssl_handshake_timeout is not None:
+                raise ValueError(
+                    'ssl_handshake_timeout is only meaningful with ssl')
+            if ssl_shutdown_timeout is not None:
+                raise ValueError(
+                    'ssl_shutdown_timeout is only meaningful with ssl')
+
         if not _is_sock_stream(sock.type):
             raise ValueError(
                 'A Stream Socket was expected, got {!r}'.format(sock))
@@ -2233,23 +2674,26 @@ cdef class Loop:
         app_protocol = protocol_factory()
         waiter = self._new_future()
         transport_waiter = None
+        context = Context_CopyCurrent()
 
         if ssl is None:
             protocol = app_protocol
             transport_waiter = waiter
         else:
-            protocol = aio_SSLProtocol(
+            protocol = SSLProtocol(
                 self, app_protocol, ssl, waiter,
-                True,  # server_side
-                None)  # server_hostname
+                server_side=True,
+                server_hostname=None,
+                ssl_handshake_timeout=ssl_handshake_timeout,
+                ssl_shutdown_timeout=ssl_shutdown_timeout)
             transport_waiter = None
 
         if sock.family == uv.AF_UNIX:
             transport = <UVStream>UnixTransport.new(
-                self, protocol, None, transport_waiter)
+                self, protocol, None, transport_waiter, context)
         elif sock.family in (uv.AF_INET, uv.AF_INET6):
             transport = <UVStream>TCPTransport.new(
-                self, protocol, None, transport_waiter)
+                self, protocol, None, transport_waiter, context)
 
         if transport is None:
             raise ValueError(
@@ -2259,11 +2703,24 @@ cdef class Loop:
         transport._init_protocol()
         transport._attach_fileobj(sock)
 
-        await waiter
-
         if ssl:
-            return protocol._app_transport, protocol
+            app_transport = protocol._get_app_transport(context)
+            try:
+                await waiter
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
+                app_transport.close()
+                raise
+            return app_transport, protocol
         else:
+            try:
+                await waiter
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
+                transport._close()
+                raise
             return transport, protocol
 
     def run_in_executor(self, executor, func, *args):
@@ -2274,6 +2731,8 @@ cdef class Loop:
 
         if executor is None:
             executor = self._default_executor
+            # Only check when the default executor is being used
+            self._check_default_executor()
             if executor is None:
                 executor = cc_ThreadPoolExecutor()
                 self._default_executor = executor
@@ -2283,6 +2742,7 @@ cdef class Loop:
     def set_default_executor(self, executor):
         self._default_executor = executor
 
+    @cython.iterable_coroutine
     async def __subprocess_run(self, protocol_factory, args,
                                stdin=subprocess_PIPE,
                                stdout=subprocess_PIPE,
@@ -2300,10 +2760,8 @@ cdef class Loop:
                                start_new_session=False,
                                executable=None,
                                pass_fds=(),
-
                                # For tests only! Do not use in your code. Ever.
-                               __uvloop_sleep_after_fork=False
-                            ):
+                               __uvloop_sleep_after_fork=False):
 
         # TODO: Implement close_fds (might not be very important in
         # Python 3.5, since all FDs aren't inheritable by default.)
@@ -2338,15 +2796,18 @@ cdef class Loop:
 
         try:
             await waiter
-        except:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
             proc.close()
             raise
 
         return proc, protocol
 
-    def subprocess_shell(self, protocol_factory, cmd, *,
-                         shell=True,
-                         **kwargs):
+    @cython.iterable_coroutine
+    async def subprocess_shell(self, protocol_factory, cmd, *,
+                               shell=True,
+                               **kwargs):
 
         if not shell:
             raise ValueError("shell must be True")
@@ -2355,20 +2816,22 @@ cdef class Loop:
         if shell:
             args = [b'/bin/sh', b'-c'] + args
 
-        return self.__subprocess_run(protocol_factory, args, shell=True,
-                                     **kwargs)
+        return await self.__subprocess_run(protocol_factory, args, shell=True,
+                                           **kwargs)
 
-    def subprocess_exec(self,  protocol_factory, program, *args,
-                        shell=False, **kwargs):
+    @cython.iterable_coroutine
+    async def subprocess_exec(self, protocol_factory, program, *args,
+                              shell=False, **kwargs):
 
         if shell:
             raise ValueError("shell must be False")
 
         args = list((program,) + args)
 
-        return self.__subprocess_run(protocol_factory, args, shell=False,
-                                     **kwargs)
+        return await self.__subprocess_run(protocol_factory, args, shell=False,
+                                           **kwargs)
 
+    @cython.iterable_coroutine
     async def connect_read_pipe(self, proto_factory, pipe):
         """Register read pipe in event loop. Set the pipe to non-blocking mode.
 
@@ -2387,12 +2850,15 @@ cdef class Loop:
             transp._open(pipe.fileno())
             transp._init_protocol()
             await waiter
-        except:
-            transp.close()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            transp._close()
             raise
         transp._attach_fileobj(pipe)
         return transp, proto
 
+    @cython.iterable_coroutine
     async def connect_write_pipe(self, proto_factory, pipe):
         """Register write pipe in event loop.
 
@@ -2411,8 +2877,10 @@ cdef class Loop:
             transp._open(pipe.fileno())
             transp._init_protocol()
             await waiter
-        except:
-            transp.close()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            transp._close()
             raise
         transp._attach_fileobj(pipe)
         return transp, proto
@@ -2426,35 +2894,60 @@ cdef class Loop:
         cdef:
             Handle h
 
-        if self._signal_handlers is None:
-            self._setup_signals()
-            if self._signal_handlers is None:
-                raise ValueError('set_wakeup_fd only works in main thread')
+        if not self._is_main_thread():
+            raise ValueError(
+                'add_signal_handler() can only be called from '
+                'the main thread')
 
         if (aio_iscoroutine(callback)
                 or aio_iscoroutinefunction(callback)):
-            raise TypeError("coroutines cannot be used "
-                            "with add_signal_handler()")
+            raise TypeError(
+                "coroutines cannot be used with add_signal_handler()")
+
+        if sig == uv.SIGCHLD:
+            if (hasattr(callback, '__self__') and
+                    isinstance(callback.__self__, aio_AbstractChildWatcher)):
+
+                warnings_warn(
+                    "!!! asyncio is trying to install its ChildWatcher for "
+                    "SIGCHLD signal !!!\n\nThis is probably because a uvloop "
+                    "instance is used with asyncio.set_event_loop(). "
+                    "The correct way to use uvloop is to install its policy: "
+                    "`asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())`"
+                    "\n\n", RuntimeWarning, source=self)
+
+                # TODO: ideally we should always raise an error here,
+                # but that would be a backwards incompatible change,
+                # because we recommended using "asyncio.set_event_loop()"
+                # in our README.  Need to start a deprecation period
+                # at some point to turn this warning into an error.
+                return
+
+            raise RuntimeError(
+                'cannot add a signal handler for SIGCHLD: it is used '
+                'by the event loop to track subprocesses')
 
         self._check_signal(sig)
         self._check_closed()
 
-        try:
-            # set_wakeup_fd() raises ValueError if this is not the
-            # main thread.  By calling it early we ensure that an
-            # event loop running in another thread cannot add a signal
-            # handler.
-            signal_set_wakeup_fd(self._csock.fileno())
-        except (ValueError, OSError) as exc:
-            raise RuntimeError(str(exc))
-
-        h = new_Handle(self, callback, args or None)
+        h = new_Handle(self, callback, args or None, None)
         self._signal_handlers[sig] = h
 
         try:
-            signal_signal(sig, _sighandler_noop)
+            # Register a dummy signal handler to ask Python to write the signal
+            # number in the wakeup file descriptor.
+            signal_signal(sig, self.__sighandler)
+
+            # Set SA_RESTART to limit EINTR occurrences.
+            signal_siginterrupt(sig, False)
         except OSError as exc:
             del self._signal_handlers[sig]
+            if not self._signal_handlers:
+                try:
+                    signal_set_wakeup_fd(-1)
+                except (ValueError, OSError) as nexc:
+                    aio_logger.info('set_wakeup_fd(-1) failed: %s', nexc)
+
             if exc.errno == errno_EINVAL:
                 raise RuntimeError('sig {} cannot be caught'.format(sig))
             else:
@@ -2465,9 +2958,15 @@ cdef class Loop:
 
         Return True if a signal handler was removed, False if not.
         """
+
+        if not self._is_main_thread():
+            raise ValueError(
+                'remove_signal_handler() can only be called from '
+                'the main thread')
+
         self._check_signal(sig)
 
-        if self._signal_handlers is None:
+        if not self._listening_signals:
             return False
 
         try:
@@ -2490,10 +2989,11 @@ cdef class Loop:
 
         return True
 
+    @cython.iterable_coroutine
     async def create_datagram_endpoint(self, protocol_factory,
                                        local_addr=None, remote_addr=None, *,
                                        family=0, proto=0, flags=0,
-                                       reuse_address=None, reuse_port=None,
+                                       reuse_address=_unset, reuse_port=None,
                                        allow_broadcast=None, sock=None):
         """A coroutine which creates a datagram endpoint.
 
@@ -2504,11 +3004,6 @@ cdef class Loop:
 
         socket family AF_INET or socket.AF_INET6 depending on host (or
         family if specified), socket type SOCK_DGRAM.
-
-        reuse_address tells the kernel to reuse a local socket in
-        TIME_WAIT state, without waiting for its natural timeout to
-        expire. If not specified it will automatically be set to True on
-        UNIX.
 
         reuse_port tells the kernel to allow this endpoint to be bound to
         the same port as other existing endpoints are bound to, so long as
@@ -2525,7 +3020,8 @@ cdef class Loop:
         """
         cdef:
             UDPTransport udp = None
-            system.sockaddr_storage rai
+            system.addrinfo * lai
+            system.addrinfo * rai
 
         if sock is not None:
             if not _is_sock_dgram(sock.type):
@@ -2533,7 +3029,7 @@ cdef class Loop:
                     'A UDP Socket was expected, got {!r}'.format(sock))
             if (local_addr or remote_addr or
                     family or proto or flags or
-                    reuse_address or reuse_port or allow_broadcast):
+                    reuse_port or allow_broadcast):
                 # show the problematic kwargs in exception msg
                 opts = dict(local_addr=local_addr, remote_addr=remote_addr,
                             family=family, proto=proto, flags=flags,
@@ -2545,83 +3041,108 @@ cdef class Loop:
                     'socket modifier keyword arguments can not be used '
                     'when sock is specified. ({})'.format(problems))
             sock.setblocking(False)
-            udp = UDPTransport.new(self, sock, None)
+            udp = UDPTransport.__new__(UDPTransport)
+            udp._init(self, uv.AF_UNSPEC)
+            udp.open(sock.family, sock.fileno())
+            udp._attach_fileobj(sock)
         else:
-            if not (local_addr or remote_addr):
-                if family == 0:
-                    raise ValueError('unexpected address family')
-                addr_pairs_info = (((family, proto), (None, None)),)
-            elif family == uv.AF_UNIX:
-                for addr in (local_addr, remote_addr):
-                    if addr is not None and not isinstance(addr, str):
-                        raise TypeError('string is expected')
-                addr_pairs_info = (((family, proto),
-                                    (local_addr, remote_addr)), )
-            else:
-                # join address by (family, protocol)
-                addr_infos = col_OrderedDict()
-                for idx, addr in ((0, local_addr), (1, remote_addr)):
-                    if addr is not None:
-                        assert isinstance(addr, tuple) and len(addr) == 2, (
-                            '2-tuple is expected')
-
-                        infos = await self.getaddrinfo(
-                            *addr[:2], family=family, type=uv.SOCK_DGRAM,
-                            proto=proto, flags=flags)
-
-                        if not infos:
-                            raise OSError('getaddrinfo() returned empty list')
-
-                        for fam, _, pro, _, address in infos:
-                            key = (fam, pro)
-                            if key not in addr_infos:
-                                addr_infos[key] = [None, None]
-                            addr_infos[key][idx] = address
-
-                # each addr has to have info for each (family, proto) pair
-                addr_pairs_info = [
-                    (key, addr_pair) for key, addr_pair in addr_infos.items()
-                    if not ((local_addr and addr_pair[0] is None) or
-                            (remote_addr and addr_pair[1] is None))]
-
-                if not addr_pairs_info:
-                    raise ValueError('can not get address information')
-
-            exceptions = []
-            for ((family, proto),
-                 (local_address, remote_address)) in addr_pairs_info:
-                sock = None
-                r_addr = None
-                try:
-                    sock = socket_socket(
-                        family=family, type=uv.SOCK_DGRAM, proto=proto)
-                    if reuse_address:
-                        sock.setsockopt(
-                            uv.SOL_SOCKET, uv.SO_REUSEADDR, 1)
-                    if reuse_port:
-                        self._sock_set_reuseport(sock.fileno())
-                    if allow_broadcast:
-                        sock.setsockopt(uv.SOL_SOCKET, SO_BROADCAST, 1)
-                    sock.setblocking(False)
-                    if local_addr:
-                        sock.bind(local_address)
-                    if remote_addr:
-                        await self.sock_connect(sock, remote_address)
-                        r_addr = remote_address
-                except OSError as exc:
-                    if sock is not None:
-                        sock.close()
-                    exceptions.append(exc)
-                except:
-                    if sock is not None:
-                        sock.close()
-                    raise
+            if reuse_address is not _unset:
+                if reuse_address:
+                    raise ValueError("Passing `reuse_address=True` is no "
+                                     "longer supported, as the usage of "
+                                     "SO_REUSEPORT in UDP poses a significant "
+                                     "security concern.")
                 else:
-                    break
-            else:
-                raise exceptions[0]
+                    warnings_warn("The *reuse_address* parameter has been "
+                                  "deprecated as of 0.15.", DeprecationWarning,
+                                  stacklevel=2)
+            reuse_port = bool(reuse_port)
+            if reuse_port and not has_SO_REUSEPORT:
+                raise ValueError(
+                    'reuse_port not supported by socket module')
 
-            udp = UDPTransport.new(self, sock, r_addr)
+            lads = None
+            if local_addr is not None:
+                if (not isinstance(local_addr, (tuple, list)) or
+                        len(local_addr) != 2):
+                    raise TypeError(
+                        'local_addr must be a tuple of (host, port)')
+                lads = await self._getaddrinfo(
+                    local_addr[0], local_addr[1],
+                    family, uv.SOCK_DGRAM, proto, flags,
+                    0)
+
+            rads = None
+            if remote_addr is not None:
+                if (not isinstance(remote_addr, (tuple, list)) or
+                        len(remote_addr) != 2):
+                    raise TypeError(
+                        'remote_addr must be a tuple of (host, port)')
+                rads = await self._getaddrinfo(
+                    remote_addr[0], remote_addr[1],
+                    family, uv.SOCK_DGRAM, proto, flags,
+                    0)
+
+            excs = []
+            if lads is None:
+                if rads is not None:
+                    udp = UDPTransport.__new__(UDPTransport)
+                    rai = (<AddrInfo>rads).data
+                    udp._init(self, rai.ai_family)
+                    udp._connect(rai.ai_addr, rai.ai_addrlen)
+                    udp._set_address(rai)
+                else:
+                    if family not in (uv.AF_INET, uv.AF_INET6):
+                        raise ValueError('unexpected address family')
+                    udp = UDPTransport.__new__(UDPTransport)
+                    udp._init(self, family)
+
+                if reuse_port:
+                    self._sock_set_reuseport(udp._fileno())
+
+            else:
+                lai = (<AddrInfo>lads).data
+                while lai is not NULL:
+                    try:
+                        udp = UDPTransport.__new__(UDPTransport)
+                        udp._init(self, lai.ai_family)
+                        if reuse_port:
+                            self._sock_set_reuseport(udp._fileno())
+                        udp._bind(lai.ai_addr)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException as ex:
+                        lai = lai.ai_next
+                        excs.append(ex)
+                        continue
+                    else:
+                        break
+                else:
+                    ctx = None
+                    if len(excs):
+                        ctx = excs[0]
+                    raise OSError('could not bind to local_addr {}'.format(
+                        local_addr)) from ctx
+
+                if rads is not None:
+                    rai = (<AddrInfo>rads).data
+                    while rai is not NULL:
+                        if rai.ai_family != lai.ai_family:
+                            rai = rai.ai_next
+                            continue
+                        if rai.ai_protocol != lai.ai_protocol:
+                            rai = rai.ai_next
+                            continue
+                        udp._connect(rai.ai_addr, rai.ai_addrlen)
+                        udp._set_address(rai)
+                        break
+                    else:
+                        raise OSError(
+                            'could not bind to remote_addr {}'.format(
+                                remote_addr))
+
+        if allow_broadcast:
+            udp._set_broadcast(1)
 
         protocol = protocol_factory()
         waiter = self._new_future()
@@ -2633,13 +3154,27 @@ cdef class Loop:
         await waiter
         return udp, protocol
 
+    def _monitor_fs(self, path: str, callback) -> asyncio.Handle:
+        cdef:
+            UVFSEvent fs_handle
+            char* c_str_path
+
+        self._check_closed()
+        fs_handle = UVFSEvent.new(self, callback, None)
+        p_bytes = path.encode('UTF-8')
+        c_str_path = p_bytes
+        flags = 0
+        fs_handle.start(c_str_path, flags)
+        return fs_handle
+
+    def _check_default_executor(self):
+        if self._executor_shutdown_called:
+            raise RuntimeError('Executor shutdown has been called')
+
     def _asyncgen_finalizer_hook(self, agen):
         self._asyncgens.discard(agen)
         if not self.is_closed():
-            self.create_task(agen.aclose())
-            # Wake up the loop if the finalizer was called from
-            # a different thread.
-            self.handler_async.send()
+            self.call_soon_threadsafe(self.create_task, agen.aclose())
 
     def _asyncgen_firstiter_hook(self, agen):
         if self._asyncgens_shutdown_called:
@@ -2650,13 +3185,12 @@ cdef class Loop:
 
         self._asyncgens.add(agen)
 
+    @cython.iterable_coroutine
     async def shutdown_asyncgens(self):
         """Shutdown all active asynchronous generators."""
         self._asyncgens_shutdown_called = True
 
-        if self._asyncgens is None or not len(self._asyncgens):
-            # If Python version is <3.6 or we don't have any asynchronous
-            # generators alive.
+        if not len(self._asyncgens):
             return
 
         closing_agens = list(self._asyncgens)
@@ -2664,8 +3198,7 @@ cdef class Loop:
 
         shutdown_coro = aio_gather(
             *[ag.aclose() for ag in closing_agens],
-            return_exceptions=True,
-            loop=self)
+            return_exceptions=True)
 
         results = await shutdown_coro
         for result, agen in zip(results, closing_agens):
@@ -2676,6 +3209,36 @@ cdef class Loop:
                     'exception': result,
                     'asyncgen': agen
                 })
+
+    @cython.iterable_coroutine
+    async def shutdown_default_executor(self):
+        """Schedule the shutdown of the default executor."""
+        self._executor_shutdown_called = True
+        if self._default_executor is None:
+            return
+        future = self.create_future()
+        thread = threading_Thread(target=self._do_shutdown, args=(future,))
+        thread.start()
+        try:
+            await future
+        finally:
+            thread.join()
+
+    def _do_shutdown(self, future):
+        try:
+            self._default_executor.shutdown(wait=True)
+            self.call_soon_threadsafe(future.set_result, None)
+        except Exception as ex:
+            self.call_soon_threadsafe(future.set_exception, ex)
+
+
+# Expose pointer for integration with other C-extensions
+def libuv_get_loop_t_ptr(loop):
+    return PyCapsule_New(<void *>(<Loop>loop).uvloop, NULL, NULL)
+
+
+def libuv_get_version():
+    return uv.uv_version()
 
 
 cdef void __loop_alloc_buffer(uv.uv_handle_t* uvhandle,
@@ -2699,8 +3262,55 @@ cdef inline void __loop_free_buffer(Loop loop):
     loop._recv_buffer_in_use = 0
 
 
+class _SyncSocketReaderFuture(aio_Future):
+
+    def __init__(self, sock, loop):
+        aio_Future.__init__(self, loop=loop)
+        self.__sock = sock
+        self.__loop = loop
+
+    def __remove_reader(self):
+        if self.__sock is not None and self.__sock.fileno() != -1:
+            self.__loop.remove_reader(self.__sock)
+            self.__sock = None
+
+    if PY39:
+        def cancel(self, msg=None):
+            self.__remove_reader()
+            aio_Future.cancel(self, msg=msg)
+
+    else:
+        def cancel(self):
+            self.__remove_reader()
+            aio_Future.cancel(self)
+
+
+class _SyncSocketWriterFuture(aio_Future):
+
+    def __init__(self, sock, loop):
+        aio_Future.__init__(self, loop=loop)
+        self.__sock = sock
+        self.__loop = loop
+
+    def __remove_writer(self):
+        if self.__sock is not None and self.__sock.fileno() != -1:
+            self.__loop.remove_writer(self.__sock)
+            self.__sock = None
+
+    if PY39:
+        def cancel(self, msg=None):
+            self.__remove_writer()
+            aio_Future.cancel(self, msg=msg)
+
+    else:
+        def cancel(self):
+            self.__remove_writer()
+            aio_Future.cancel(self)
+
+
 include "cbhandles.pyx"
 include "pseudosock.pyx"
+include "lru.pyx"
 
 include "handles/handle.pyx"
 include "handles/async_.pyx"
@@ -2714,9 +3324,11 @@ include "handles/streamserver.pyx"
 include "handles/tcp.pyx"
 include "handles/pipe.pyx"
 include "handles/process.pyx"
+include "handles/fsevent.pyx"
 
 include "request.pyx"
 include "dns.pyx"
+include "sslproto.pyx"
 
 include "handles/udp.pyx"
 
@@ -2729,17 +3341,11 @@ cdef vint __forking = 0
 cdef Loop __forking_loop = None
 
 
-cdef void __atfork_child() nogil:
-    # See CPython/posixmodule.c for details
-    global __forking
-
+cdef void __get_fork_handler() nogil:
     with gil:
-        if (__forking and
-                __forking_loop is not None and
+        if (__forking and __forking_loop is not None and
                 __forking_loop.active_process_handler is not None):
-
             __forking_loop.active_process_handler._after_fork()
-
 
 cdef __install_atfork():
     global __atfork_installed
@@ -2753,7 +3359,7 @@ cdef __install_atfork():
 
     cdef int err
 
-    err = system.pthread_atfork(NULL, NULL, &__atfork_child)
+    err = system.pthread_atfork(NULL, NULL, &system.handleAtFork)
     if err:
         __atfork_installed = 0
         raise convert_error(-err)
@@ -2777,12 +3383,15 @@ cdef __install_pymem():
         raise convert_error(err)
 
 
-def _sighandler_noop(signum, frame):
-    """Dummy signal handler."""
-    pass
+cdef _set_signal_wakeup_fd(fd):
+    if fd >= 0:
+        return signal_set_wakeup_fd(fd, warn_on_full_buffer=False)
+    else:
+        return signal_set_wakeup_fd(fd)
 
 
-########### Stuff for tests:
+# Helpers for tests
 
+@cython.iterable_coroutine
 async def _test_coroutine_1():
     return 42

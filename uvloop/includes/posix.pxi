@@ -1,3 +1,5 @@
+from libc.stdint cimport int8_t, uint64_t
+
 cdef extern from "arpa/inet.h" nogil:
 
     int ntohl(int)
@@ -45,18 +47,26 @@ cdef extern from "sys/socket.h" nogil:
                    const void *option_value, int option_len)
 
 
+cdef extern from "sys/un.h" nogil:
+
+    struct sockaddr_un:
+        unsigned short sun_family
+        char*          sun_path
+        # ...
+
+
 cdef extern from "unistd.h" nogil:
 
     ssize_t write(int fd, const void *buf, size_t count)
     void _exit(int status)
 
 
-cdef extern from "pthread.h" nogil:
+cdef extern from "pthread.h":
 
     int pthread_atfork(
-        void (*prepare)() nogil,
-        void (*parent)() nogil,
-        void (*child)() nogil)
+        void (*prepare)(),
+        void (*parent)(),
+        void (*child)())
 
 
 cdef extern from "includes/compat.h" nogil:
@@ -72,3 +82,15 @@ cdef extern from "includes/compat.h" nogil:
 
     int EPOLL_CTL_DEL
     int epoll_ctl(int epfd, int op, int fd, epoll_event *event)
+    object MakeUnixSockPyAddr(sockaddr_un *addr)
+
+
+cdef extern from "includes/fork_handler.h":
+
+    uint64_t MAIN_THREAD_ID
+    int8_t MAIN_THREAD_ID_SET
+    ctypedef void (*OnForkHandler)()
+    void handleAtFork()
+    void setForkHandler(OnForkHandler handler)
+    void resetForkHandler()
+    void setMainThreadID(uint64_t id)
